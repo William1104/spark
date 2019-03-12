@@ -19,19 +19,19 @@ package org.apache.spark.sql.hive
 
 import java.io.File
 
-import org.apache.spark.sql.{AnalysisException, Dataset, QueryTest, SaveMode}
-import org.apache.spark.sql.catalyst.analysis.NoSuchTableException
 import org.apache.spark.sql.catalyst.parser.ParseException
 import org.apache.spark.sql.execution.columnar.InMemoryTableScanExec
-import org.apache.spark.sql.execution.datasources.{CatalogFileIndex, HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.execution.datasources.parquet.ParquetFileFormat
+import org.apache.spark.sql.execution.datasources.{CatalogFileIndex, HadoopFsRelation, LogicalRelation}
 import org.apache.spark.sql.hive.test.TestHiveSingleton
 import org.apache.spark.sql.test.SQLTestUtils
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.sql.{AnalysisException, Dataset, QueryTest, SaveMode}
 import org.apache.spark.storage.RDDBlockId
 import org.apache.spark.util.Utils
 
 class CachedTableSuite extends QueryTest with SQLTestUtils with TestHiveSingleton {
+
   import hiveContext._
 
   def rddIdOf(tableName: String): Int = {
@@ -231,6 +231,48 @@ class CachedTableSuite extends QueryTest with SQLTestUtils with TestHiveSingleto
     sql("DROP TABLE refreshTable")
     Utils.deleteRecursively(tempPath)
   }
+
+  test("Refresh Qualified Tables") {
+    withTempDatabase { db =>
+      withTempView("cachedTable") {
+        try {
+          sql(s"CREATE TABLE $db.cachedTable STORED AS PARQUET AS SELECT 1")
+          sql(s"CACHE TABLE $db.cachedTable")
+          assertCachedWithName(sql(s"select * from $db.cachedTable"), s"`$db`.`cachedTable`")
+
+          sql(s"REFRESH TABLE $db.cachedTable")
+          assertCachedWithName(sql(s"select * from $db.cachedTable"), s"`$db`.`cachedTable`")
+
+          activateDatabase(db) {
+            assertCachedWithName(sql("select * from cachedTable"), s"`$db`.`cachedTable`")
+
+            sql(s"REFRESH TABLE cachedTable")
+            assertCachedWithName(sql("select * from cachedTable"), s"`$db`.`cachedTable`")
+          }
+        } finally {
+          sql(s"UNCACHE TABLE $db.cachedTable")
+          sql(s"DROP TABLE $db.cachedTable")
+        }
+      }
+    }
+  }
+
+  test("Refresh Unqualified Tables") {
+    withTempView("cachedTable") {
+      try {
+        sql(s"CREATE TABLE cachedTable STORED AS PARQUET AS SELECT 1")
+        sql(s"CACHE TABLE cachedTable")
+        assertCachedWithName(sql(s"select * from cachedTable"), s"`cachedTable`")
+
+        sql(s"REFRESH TABLE cachedTable")
+        assertCachedWithName(sql(s"select * from cachedTable"), s"`cachedTable`")
+      } finally {
+        sql(s"UNCACHE TABLE cachedTable")
+        sql(s"DROP TABLE cachedTable")
+      }
+    }
+  }
+
 
   test("SPARK-15678: REFRESH PATH") {
     val tempPath: File = Utils.createTempDir()

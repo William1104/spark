@@ -20,10 +20,11 @@ package org.apache.spark.sql
 import java.util.{Locale, TimeZone}
 
 import scala.collection.JavaConverters._
-
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.util._
 import org.apache.spark.sql.execution.columnar.InMemoryRelation
+import org.apache.spark.storage.StorageLevel
+import org.apache.spark.storage.StorageLevel.MEMORY_AND_DISK
 
 
 abstract class QueryTest extends PlanTest {
@@ -213,6 +214,21 @@ abstract class QueryTest extends PlanTest {
       cachedData.size == numCachedTables,
       s"Expected query to contain $numCachedTables, but it actually had ${cachedData.size}\n" +
         planWithCaching)
+  }
+
+  /**
+    * Asserts that a given [[Dataset]] will be executed using the given named cache.
+    */
+  def assertCachedWithName(query: Dataset[_], cachedName: String): Unit = {
+    val planWithCaching = query.queryExecution.withCachedData
+    val cached = planWithCaching collect {
+      case cached: InMemoryRelation if
+        cached.tableName.get == cachedName => cached
+    }
+
+    assert(
+      cached.nonEmpty,
+      s"Expected query to contain cache $cachedName, but it doesn't.")
   }
 
   /**
