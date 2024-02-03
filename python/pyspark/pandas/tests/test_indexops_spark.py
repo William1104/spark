@@ -16,30 +16,31 @@
 #
 
 import pandas as pd
-from pyspark.sql.utils import AnalysisException
+
+from pyspark.errors import AnalysisException
 from pyspark.sql import functions as F
-
 from pyspark import pandas as ps
-from pyspark.pandas.testing.utils import ReusedSQLTestCase, SQLTestUtils
+from pyspark.testing.pandasutils import PandasOnSparkTestCase
+from pyspark.testing.sqlutils import SQLTestUtils
 
 
-class SparkIndexOpsMethodsTest(ReusedSQLTestCase, SQLTestUtils):
+class SparkIndexOpsMethodsTestsMixin:
     @property
     def pser(self):
         return pd.Series([1, 2, 3, 4, 5, 6, 7], name="x")
 
     @property
-    def kser(self):
+    def psser(self):
         return ps.from_pandas(self.pser)
 
     def test_series_transform_negative(self):
         with self.assertRaisesRegex(
             ValueError, "The output of the function.* pyspark.sql.Column.*int"
         ):
-            self.kser.spark.transform(lambda scol: 1)
+            self.psser.spark.transform(lambda scol: 1)
 
-        with self.assertRaisesRegex(AnalysisException, "cannot resolve.*non-existent.*"):
-            self.kser.spark.transform(lambda scol: F.col("non-existent"))
+        with self.assertRaisesRegex(AnalysisException, ".*UNRESOLVED_COLUMN.*`non-existent`.*"):
+            self.psser.spark.transform(lambda scol: F.col("non-existent"))
 
     def test_multiindex_transform_negative(self):
         with self.assertRaisesRegex(
@@ -56,10 +57,16 @@ class SparkIndexOpsMethodsTest(ReusedSQLTestCase, SQLTestUtils):
         with self.assertRaisesRegex(
             ValueError, "The output of the function.* pyspark.sql.Column.*int"
         ):
-            self.kser.spark.apply(lambda scol: 1)
+            self.psser.spark.apply(lambda scol: 1)
 
-        with self.assertRaisesRegex(AnalysisException, "cannot resolve.*non-existent.*"):
-            self.kser.spark.transform(lambda scol: F.col("non-existent"))
+        with self.assertRaisesRegex(AnalysisException, ".*UNRESOLVED_COLUMN.*`non-existent`.*"):
+            self.psser.spark.transform(lambda scol: F.col("non-existent"))
+
+
+class SparkIndexOpsMethodsTests(
+    SparkIndexOpsMethodsTestsMixin, PandasOnSparkTestCase, SQLTestUtils
+):
+    pass
 
 
 if __name__ == "__main__":
@@ -67,8 +74,9 @@ if __name__ == "__main__":
     from pyspark.pandas.tests.test_indexops_spark import *  # noqa: F401
 
     try:
-        import xmlrunner  # type: ignore[import]
-        testRunner = xmlrunner.XMLTestRunner(output='target/test-reports', verbosity=2)
+        import xmlrunner
+
+        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
     except ImportError:
         testRunner = None
     unittest.main(testRunner=testRunner, verbosity=2)

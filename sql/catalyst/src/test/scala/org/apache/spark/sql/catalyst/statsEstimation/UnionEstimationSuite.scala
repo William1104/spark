@@ -57,6 +57,9 @@ class UnionEstimationSuite extends StatsEstimationTestBase {
     val attrDecimal = AttributeReference("cdecimal", DecimalType(5, 4))()
     val attrDate = AttributeReference("cdate", DateType)()
     val attrTimestamp = AttributeReference("ctimestamp", TimestampType)()
+    val attrTimestampNTZ = AttributeReference("ctimestamp_ntz", TimestampNTZType)()
+    val attrYMInterval = AttributeReference("cyminterval", YearMonthIntervalType())()
+    val attrDTInterval = AttributeReference("cdtinterval", DayTimeIntervalType())()
 
     val s1 = 1.toShort
     val s2 = 4.toShort
@@ -68,14 +71,14 @@ class UnionEstimationSuite extends StatsEstimationTestBase {
           distinctCount = Some(2),
           min = Some(1),
           max = Some(4),
-          nullCount = Some(0),
+          nullCount = Some(1),
           avgLen = Some(4),
           maxLen = Some(4)),
         attrDouble -> ColumnStat(
           distinctCount = Some(2),
           min = Some(5.0),
           max = Some(4.0),
-          nullCount = Some(0),
+          nullCount = Some(2),
           avgLen = Some(4),
           maxLen = Some(4)),
         attrShort -> ColumnStat(min = Some(s1), max = Some(s2)),
@@ -84,7 +87,10 @@ class UnionEstimationSuite extends StatsEstimationTestBase {
         attrFloat -> ColumnStat(min = Some(1.1f), max = Some(4.1f)),
         attrDecimal -> ColumnStat(min = Some(Decimal(13.5)), max = Some(Decimal(19.5))),
         attrDate -> ColumnStat(min = Some(1), max = Some(4)),
-        attrTimestamp -> ColumnStat(min = Some(1L), max = Some(4L))))
+        attrTimestamp -> ColumnStat(min = Some(1L), max = Some(4L)),
+        attrTimestampNTZ -> ColumnStat(min = Some(1L), max = Some(4L)),
+        attrYMInterval -> ColumnStat(min = Some(2), max = Some(5)),
+        attrDTInterval -> ColumnStat(min = Some(2L), max = Some(5L))))
 
     val s3 = 2.toShort
     val s4 = 6.toShort
@@ -96,14 +102,14 @@ class UnionEstimationSuite extends StatsEstimationTestBase {
           distinctCount = Some(2),
           min = Some(3),
           max = Some(6),
-          nullCount = Some(0),
+          nullCount = Some(1),
           avgLen = Some(8),
           maxLen = Some(8)),
         AttributeReference("cdouble1", DoubleType)() -> ColumnStat(
           distinctCount = Some(2),
           min = Some(2.0),
           max = Some(7.0),
-          nullCount = Some(0),
+          nullCount = Some(2),
           avgLen = Some(8),
           maxLen = Some(8)),
         AttributeReference("cshort1", ShortType)() -> ColumnStat(min = Some(s3), max = Some(s4)),
@@ -118,7 +124,16 @@ class UnionEstimationSuite extends StatsEstimationTestBase {
         AttributeReference("cdate1", DateType)() -> ColumnStat(min = Some(3), max = Some(6)),
         AttributeReference("ctimestamp1", TimestampType)() -> ColumnStat(
           min = Some(3L),
-          max = Some(6L))))
+          max = Some(6L)),
+        AttributeReference("ctimestamp_ntz1", TimestampNTZType)() -> ColumnStat(
+          min = Some(3L),
+          max = Some(6L)),
+        AttributeReference("cymtimestamp1", YearMonthIntervalType())() -> ColumnStat(
+          min = Some(4),
+          max = Some(8)),
+        AttributeReference("cdttimestamp1", DayTimeIntervalType())() -> ColumnStat(
+          min = Some(4L),
+          max = Some(8L))))
 
     val child1 = StatsTestPlan(
       outputList = columnInfo.keys.toSeq.sortWith(_.exprId.id < _.exprId.id),
@@ -139,15 +154,18 @@ class UnionEstimationSuite extends StatsEstimationTestBase {
       rowCount = Some(4),
       attributeStats = AttributeMap(
         Seq(
-          attrInt -> ColumnStat(min = Some(1), max = Some(6)),
-          attrDouble -> ColumnStat(min = Some(2.0), max = Some(7.0)),
+          attrInt -> ColumnStat(min = Some(1), max = Some(6), nullCount = Some(2)),
+          attrDouble -> ColumnStat(min = Some(2.0), max = Some(7.0), nullCount = Some(4)),
           attrShort -> ColumnStat(min = Some(s1), max = Some(s4)),
           attrLong -> ColumnStat(min = Some(1L), max = Some(6L)),
           attrByte -> ColumnStat(min = Some(b1), max = Some(b4)),
           attrFloat -> ColumnStat(min = Some(1.1f), max = Some(6.1f)),
           attrDecimal -> ColumnStat(min = Some(Decimal(13.5)), max = Some(Decimal(19.9))),
           attrDate -> ColumnStat(min = Some(1), max = Some(6)),
-          attrTimestamp -> ColumnStat(min = Some(1L), max = Some(6L)))))
+          attrTimestamp -> ColumnStat(min = Some(1L), max = Some(6L)),
+          attrTimestampNTZ -> ColumnStat(min = Some(1L), max = Some(6L)),
+          attrYMInterval -> ColumnStat(min = Some(2), max = Some(8)),
+          attrDTInterval -> ColumnStat(min = Some(2L), max = Some(8L)))))
     assert(union.stats === expectedStats)
   }
 
@@ -188,7 +206,58 @@ class UnionEstimationSuite extends StatsEstimationTestBase {
 
     val union = Union(Seq(child1, child2))
 
-    val expectedStats = logical.Statistics(sizeInBytes = 2 * 1024, rowCount = Some(4))
+    // Only null count is present in the attribute stats
+    val expectedStats = logical.Statistics(
+      sizeInBytes = 2 * 1024,
+      rowCount = Some(4),
+      attributeStats = AttributeMap(
+        Seq(attrInt -> ColumnStat(nullCount = Some(0)))))
+    assert(union.stats === expectedStats)
+  }
+
+  test("col stats estimation when null count stats are not present for one child") {
+    val sz = Some(BigInt(1024))
+    val attrInt = AttributeReference("cint", IntegerType)()
+    val columnInfo = AttributeMap(
+      Seq(
+        attrInt -> ColumnStat(
+          distinctCount = Some(2),
+          min = Some(1),
+          max = Some(2),
+          nullCount = Some(2),
+          avgLen = Some(4),
+          maxLen = Some(4))))
+
+    // No null count
+    val columnInfo1 = AttributeMap(
+      Seq(
+        AttributeReference("cint1", IntegerType)() -> ColumnStat(
+          distinctCount = Some(2),
+          min = Some(3),
+          max = Some(4),
+          avgLen = Some(8),
+          maxLen = Some(8))))
+
+    val child1 = StatsTestPlan(
+      outputList = columnInfo.keys.toSeq,
+      rowCount = 2,
+      attributeStats = columnInfo,
+      size = sz)
+
+    val child2 = StatsTestPlan(
+      outputList = columnInfo1.keys.toSeq,
+      rowCount = 2,
+      attributeStats = columnInfo1,
+      size = sz)
+
+    val union = Union(Seq(child1, child2))
+
+    // Null count should not present in the stats.
+    val expectedStats = logical.Statistics(
+      sizeInBytes = 2 * 1024,
+      rowCount = Some(4),
+      attributeStats = AttributeMap(
+        Seq(attrInt -> ColumnStat(min = Some(1), max = Some(4), nullCount = None))))
     assert(union.stats === expectedStats)
   }
 }

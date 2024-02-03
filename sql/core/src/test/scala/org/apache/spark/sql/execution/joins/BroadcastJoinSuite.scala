@@ -20,6 +20,7 @@ package org.apache.spark.sql.execution.joins
 import scala.reflect.ClassTag
 
 import org.apache.spark.AccumulatorSuite
+import org.apache.spark.internal.config.EXECUTOR_MEMORY
 import org.apache.spark.sql.{Dataset, QueryTest, Row, SparkSession}
 import org.apache.spark.sql.catalyst.expressions.{AttributeReference, BitwiseAnd, BitwiseOr, Cast, Expression, Literal, ShiftLeft}
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight, BuildSide}
@@ -34,6 +35,7 @@ import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SQLTestUtils
 import org.apache.spark.sql.types.{LongType, ShortType}
+import org.apache.spark.tags.ExtendedSQLTest
 
 /**
  * Test various broadcast join operators.
@@ -48,13 +50,16 @@ abstract class BroadcastJoinSuiteBase extends QueryTest with SQLTestUtils
 
   protected var spark: SparkSession = null
 
+  private val EnsureRequirements = new EnsureRequirements()
+
   /**
    * Create a new [[SparkSession]] running in local-cluster mode with unsafe and codegen enabled.
    */
   override def beforeAll(): Unit = {
     super.beforeAll()
     spark = SparkSession.builder()
-      .master("local-cluster[2,1,1024]")
+      .master("local-cluster[2,1,512]")
+      .config(EXECUTOR_MEMORY.key, "512m")
       .appName("testing")
       .getOrCreate()
   }
@@ -66,6 +71,11 @@ abstract class BroadcastJoinSuiteBase extends QueryTest with SQLTestUtils
     } finally {
       super.afterAll()
     }
+  }
+
+  override def beforeEach(): Unit = {
+    super.beforeEach()
+    System.gc()
   }
 
   /**
@@ -400,28 +410,29 @@ abstract class BroadcastJoinSuiteBase extends QueryTest with SQLTestUtils
         assert(b.buildSide === buildSide)
       case w: WholeStageCodegenExec =>
         assert(w.children.head.getClass.getSimpleName === joinMethod)
-        if (w.children.head.isInstanceOf[BroadcastNestedLoopJoinExec]) {
-          assert(
-            w.children.head.asInstanceOf[BroadcastNestedLoopJoinExec].buildSide === buildSide)
-        } else if (w.children.head.isInstanceOf[BroadcastHashJoinExec]) {
-          assert(w.children.head.asInstanceOf[BroadcastHashJoinExec].buildSide === buildSide)
-        } else {
-          fail()
+        w.children.head match {
+          case bnlj: BroadcastNestedLoopJoinExec =>
+            assert(bnlj.buildSide === buildSide)
+          case bhj: BroadcastHashJoinExec =>
+            assert(bhj.buildSide === buildSide)
+          case _ => fail()
         }
     }
   }
 
   test("Broadcast timeout") {
     val timeout = 5
-    val slowUDF = udf({ x: Int => Thread.sleep(timeout * 10 * 1000); x })
-    val df1 = spark.range(10).select($"id" as 'a)
-    val df2 = spark.range(5).select(slowUDF($"id") as 'a)
+    val slowUDF = udf({ x: Int => Thread.sleep(timeout * 1000); x })
+    val df1 = spark.range(10).select($"id" as Symbol("a"))
+    val df2 = spark.range(5).select(slowUDF($"id") as Symbol("a"))
     val testDf = df1.join(broadcast(df2), "a")
     withSQLConf(SQLConf.BROADCAST_TIMEOUT.key -> timeout.toString) {
-      val e = intercept[Exception] {
-        testDf.collect()
+      if (!conf.adaptiveExecutionEnabled) {
+        val e = intercept[Exception] {
+          testDf.collect()
+        }
+        assert(e.getMessage.contains(s"Could not execute broadcast in $timeout secs."))
       }
-      assert(e.getMessage.contains(s"Could not execute broadcast in $timeout secs."))
     }
   }
 
@@ -479,9 +490,9 @@ abstract class BroadcastJoinSuiteBase extends QueryTest with SQLTestUtils
   test("broadcast join where streamed side's output partitioning is PartitioningCollection") {
     withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "500") {
       val t1 = (0 until 100).map(i => (i % 5, i % 13)).toDF("i1", "j1")
-      val t2 = (0 until 100).map(i => (i % 5, i % 13)).toDF("i2", "j2")
+      val t2 = (0 until 100).map(i => (i % 5, i % 14)).toDF("i2", "j2")
       val t3 = (0 until 20).map(i => (i % 7, i % 11)).toDF("i3", "j3")
-      val t4 = (0 until 100).map(i => (i % 5, i % 13)).toDF("i4", "j4")
+      val t4 = (0 until 100).map(i => (i % 5, i % 15)).toDF("i4", "j4")
 
       // join1 is a sort merge join (shuffle on the both sides).
       val join1 = t1.join(t2, t1("i1") === t2("i2"))
@@ -544,8 +555,8 @@ abstract class BroadcastJoinSuiteBase extends QueryTest with SQLTestUtils
       right = DummySparkPlan())
     var expected = PartitioningCollection(Seq(
       HashPartitioning(Seq(l1, l2, l3), 1),
-      HashPartitioning(Seq(l1, l2, r2), 1),
       HashPartitioning(Seq(l1, r1, l3), 1),
+      HashPartitioning(Seq(l1, l2, r2), 1),
       HashPartitioning(Seq(l1, r1, r2), 1)))
     assert(bhj.outputPartitioning === expected)
 
@@ -561,8 +572,8 @@ abstract class BroadcastJoinSuiteBase extends QueryTest with SQLTestUtils
       right = DummySparkPlan())
     expected = PartitioningCollection(Seq(
       HashPartitioning(Seq(l1, l2), 1),
-      HashPartitioning(Seq(l1, r2), 1),
       HashPartitioning(Seq(r1, l2), 1),
+      HashPartitioning(Seq(l1, r2), 1),
       HashPartitioning(Seq(r1, r2), 1),
       HashPartitioning(Seq(l3), 1),
       HashPartitioning(Seq(r3), 1)))
@@ -613,8 +624,8 @@ abstract class BroadcastJoinSuiteBase extends QueryTest with SQLTestUtils
 
     val expected = Seq(
       HashPartitioning(Seq(l1, l2), 1),
-      HashPartitioning(Seq(l1, r2), 1),
       HashPartitioning(Seq(r1, l2), 1),
+      HashPartitioning(Seq(l1, r2), 1),
       HashPartitioning(Seq(r1, r2), 1))
 
     Seq(1, 2, 3, 4).foreach { limit =>
@@ -633,11 +644,39 @@ abstract class BroadcastJoinSuiteBase extends QueryTest with SQLTestUtils
     }
   }
 
+  test("SPARK-37742: join planning shouldn't read invalid InMemoryRelation stats") {
+    withSQLConf(SQLConf.AUTO_BROADCASTJOIN_THRESHOLD.key -> "10") {
+      try {
+        val df1 = Seq(1).toDF("key")
+        val df2 = Seq((1, "1"), (2, "2")).toDF("key", "value")
+        df2.persist()
+        df2.queryExecution.toRdd
+
+        val df3 = df1.join(df2, Seq("key"), "inner")
+        val numCachedPlan = collect(df3.queryExecution.executedPlan) {
+          case i: InMemoryTableScanExec => i
+        }.size
+        // df2 should be cached.
+        assert(numCachedPlan === 1)
+
+        val numBroadCastHashJoin = collect(df3.queryExecution.executedPlan) {
+          case b: BroadcastHashJoinExec => b
+        }.size
+        // df2 should not be broadcasted.
+        assert(numBroadCastHashJoin === 0)
+      } finally {
+        spark.catalog.clearCache()
+      }
+    }
+  }
+
   private def expressionsEqual(l: Seq[Expression], r: Seq[Expression]): Boolean = {
     l.length == r.length && l.zip(r).forall { case (e1, e2) => e1.semanticEquals(e2) }
   }
 }
 
+@ExtendedSQLTest
 class BroadcastJoinSuite extends BroadcastJoinSuiteBase with DisableAdaptiveExecutionSuite
 
+@ExtendedSQLTest
 class BroadcastJoinSuiteAE extends BroadcastJoinSuiteBase with EnableAdaptiveExecutionSuite

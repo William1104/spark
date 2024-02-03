@@ -29,6 +29,7 @@ import org.apache.spark.sql.functions._
 import org.apache.spark.sql.internal.SQLConf.{CONTINUOUS_STREAMING_EPOCH_BACKLOG_QUEUE_SIZE, MIN_BATCHES_TO_RETAIN}
 import org.apache.spark.sql.streaming.{StreamTest, Trigger}
 import org.apache.spark.sql.test.TestSparkSession
+import org.apache.spark.tags.SlowSQLTest
 
 class ContinuousSuiteBase extends StreamTest {
   // We need more than the default local[2] to be able to schedule all partitions simultaneously.
@@ -54,27 +55,31 @@ class ContinuousSuiteBase extends StreamTest {
 
   protected def waitForRateSourceCommittedValue(
       query: ContinuousExecution,
-      desiredValue: Long,
+      partitionIdToDesiredValue: Map[Int, Long],
       maxWaitTimeMs: Long): Unit = {
-    def readHighestCommittedValue(c: ContinuousExecution): Option[Long] = {
+    def readCommittedValues(c: ContinuousExecution): Option[Map[Int, Long]] = {
       c.committedOffsets.lastOption.map { case (_, offset) =>
         offset match {
           case o: RateStreamOffset =>
-            o.partitionToValueAndRunTimeMs.map {
-              case (_, ValueRunTimeMsPair(value, _)) => value
-            }.max
+            o.partitionToValueAndRunTimeMs.transform((_, v) => v.value)
         }
       }
     }
 
+    def reachDesiredValues: Boolean = {
+      val committedValues = readCommittedValues(query).getOrElse(Map.empty)
+      partitionIdToDesiredValue.forall { case (key, value) =>
+        committedValues.contains(key) && committedValues(key) > value
+      }
+    }
+
     val maxWait = System.currentTimeMillis() + maxWaitTimeMs
-    while (System.currentTimeMillis() < maxWait &&
-      readHighestCommittedValue(query).getOrElse(Long.MinValue) < desiredValue) {
+    while (System.currentTimeMillis() < maxWait && !reachDesiredValues) {
       Thread.sleep(100)
     }
     if (System.currentTimeMillis() > maxWait) {
       logWarning(s"Couldn't reach desired value in $maxWaitTimeMs milliseconds!" +
-        s"Current highest committed value is ${readHighestCommittedValue(query)}")
+        s"Current committed values is ${readCommittedValues(query)}")
     }
   }
 
@@ -85,6 +90,7 @@ class ContinuousSuiteBase extends StreamTest {
   override protected val defaultTrigger = Trigger.Continuous(100)
 }
 
+@SlowSQLTest
 class ContinuousSuite extends ContinuousSuiteBase {
   import IntegratedUDFTestUtils._
   import testImplicits._
@@ -144,7 +150,7 @@ class ContinuousSuite extends ContinuousSuiteBase {
 
   test("filter") {
     val input = ContinuousMemoryStream[Int]
-    val df = input.toDF().where('value > 2)
+    val df = input.toDF().where($"value" > 2)
 
     testStream(df)(
       AddData(input, 0, 1),
@@ -253,7 +259,7 @@ class ContinuousSuite extends ContinuousSuiteBase {
       .option("numPartitions", "2")
       .option("rowsPerSecond", "2")
       .load()
-      .select('value)
+      .select($"value")
 
     val query = df.writeStream
       .format("memory")
@@ -264,7 +270,7 @@ class ContinuousSuite extends ContinuousSuiteBase {
     val expected = Set(0, 1, 2, 3)
     val continuousExecution =
       query.asInstanceOf[StreamingQueryWrapper].streamingQuery.asInstanceOf[ContinuousExecution]
-    waitForRateSourceCommittedValue(continuousExecution, expected.max, 20 * 1000)
+    waitForRateSourceCommittedValue(continuousExecution, Map(0 -> 2, 1 -> 3), 20 * 1000)
     query.stop()
 
     val results = spark.read.table("noharness").collect()
@@ -275,7 +281,7 @@ class ContinuousSuite extends ContinuousSuiteBase {
   Seq(TestScalaUDF("udf"), TestPythonUDF("udf"), TestScalarPandasUDF("udf")).foreach { udf =>
     test(s"continuous mode with various UDFs - ${udf.prettyName}") {
       assume(
-        shouldTestScalarPandasUDFs && udf.isInstanceOf[TestScalarPandasUDF] ||
+        shouldTestPandasUDFs && udf.isInstanceOf[TestScalarPandasUDF] ||
         shouldTestPythonUDFs && udf.isInstanceOf[TestPythonUDF] ||
         udf.isInstanceOf[TestScalaUDF])
 
@@ -293,6 +299,7 @@ class ContinuousSuite extends ContinuousSuiteBase {
   }
 }
 
+@SlowSQLTest
 class ContinuousStressSuite extends ContinuousSuiteBase {
   import testImplicits._
 
@@ -302,7 +309,7 @@ class ContinuousStressSuite extends ContinuousSuiteBase {
       .option("numPartitions", "5")
       .option("rowsPerSecond", "500")
       .load()
-      .select('value)
+      .select($"value")
 
     testStream(df)(
       StartStream(longContinuousTrigger),
@@ -322,7 +329,7 @@ class ContinuousStressSuite extends ContinuousSuiteBase {
       .option("numPartitions", "5")
       .option("rowsPerSecond", "500")
       .load()
-      .select('value)
+      .select($"value")
 
     testStream(df)(
       StartStream(Trigger.Continuous(2012)),
@@ -341,7 +348,7 @@ class ContinuousStressSuite extends ContinuousSuiteBase {
       .option("numPartitions", "5")
       .option("rowsPerSecond", "500")
       .load()
-      .select('value)
+      .select($"value")
 
     testStream(df)(
       StartStream(Trigger.Continuous(1012)),
@@ -368,6 +375,7 @@ class ContinuousStressSuite extends ContinuousSuiteBase {
   }
 }
 
+@SlowSQLTest
 class ContinuousMetaSuite extends ContinuousSuiteBase {
   import testImplicits._
 
@@ -432,7 +440,7 @@ class ContinuousEpochBacklogSuite extends ContinuousSuiteBase {
         .option("numPartitions", "2")
         .option("rowsPerSecond", "500")
         .load()
-        .select('value)
+        .select($"value")
 
       testStream(df)(
         StartStream(Trigger.Continuous(1)),

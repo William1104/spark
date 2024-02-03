@@ -11,6 +11,18 @@ CREATE OR REPLACE TEMPORARY VIEW script_trans AS SELECT * FROM VALUES
 (7, 8, 9)
 AS script_trans(a, b, c);
 
+CREATE OR REPLACE TEMPORARY VIEW complex_trans AS SELECT * FROM VALUES
+(1, 1),
+(1, 1),
+(2, 2),
+(2, 2),
+(3, 3),
+(2, 2),
+(3, 3),
+(1, 1),
+(3, 3)
+as complex_trans(a, b);
+
 SELECT TRANSFORM(a)
 USING 'cat' AS (a)
 FROM t;
@@ -107,6 +119,49 @@ USING 'cat' AS (d)
   FIELDS TERMINATED BY '@'
   LINES TERMINATED BY '\n'
   NULL DEFINED AS 'NULL'
+FROM t;
+
+SELECT TRANSFORM(a, b, c, null)
+  ROW FORMAT DELIMITED
+  FIELDS TERMINATED BY '@'
+  LINES TERMINATED BY '\n'
+USING 'cat' AS (a, b, c, d)
+  ROW FORMAT DELIMITED
+  FIELDS TERMINATED BY '@'
+  LINES TERMINATED BY '\n'
+  NULL DEFINED AS 'NULL'
+FROM t;
+
+SELECT TRANSFORM(a, b, c, null)
+  ROW FORMAT DELIMITED
+  FIELDS TERMINATED BY '@'
+  LINES TERMINATED BY '\n'
+USING 'cat' AS (a, b, c, d)
+  ROW FORMAT DELIMITED
+  FIELDS TERMINATED BY '@'
+  LINES TERMINATED BY '\n'
+FROM t;
+
+SELECT TRANSFORM(a, b, c, null)
+  ROW FORMAT DELIMITED
+  FIELDS TERMINATED BY '@'
+  LINES TERMINATED BY '\n'
+  NULL DEFINED AS 'XXXX'
+USING 'cat' AS (a, b, c, d)
+  ROW FORMAT DELIMITED
+  FIELDS TERMINATED BY '@'
+  LINES TERMINATED BY '\n'
+FROM t;
+
+SELECT TRANSFORM(a, b, c, null)
+  ROW FORMAT DELIMITED
+  FIELDS TERMINATED BY '@'
+  LINES TERMINATED BY '\n'
+  NULL DEFINED AS '\n'
+USING 'cat' AS (a, b, c, d)
+  ROW FORMAT DELIMITED
+  FIELDS TERMINATED BY '@'
+  LINES TERMINATED BY '\n'
 FROM t;
 
 -- transform with defined row format delimit handle schema with correct type
@@ -342,3 +397,22 @@ SELECT TRANSFORM(b, MAX(a) AS max_a, CAST(sum(c) AS STRING))
 FROM script_trans
 WHERE a <= 2
 GROUP BY b;
+
+-- SPARK-33985: TRANSFORM with CLUSTER BY/ORDER BY/SORT BY
+FROM (
+  SELECT TRANSFORM(a, b)
+    USING 'cat' AS (a, b)
+  FROM complex_trans
+  CLUSTER BY a
+) map_output
+SELECT TRANSFORM(a, b)
+  USING 'cat' AS (a, b);
+
+FROM (
+  SELECT TRANSFORM(a, b)
+    USING 'cat' AS (a, b)
+  FROM complex_trans
+  ORDER BY a
+) map_output
+SELECT TRANSFORM(a, b)
+  USING 'cat' AS (a, b);

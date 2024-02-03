@@ -32,13 +32,13 @@ import org.scalatest.time.SpanSugar._
 
 import org.apache.spark.SparkEnv
 import org.apache.spark.sql.{Dataset, Encoder, QueryTest, Row}
-import org.apache.spark.sql.catalyst.encoders.{encoderFor, ExpressionEncoder, RowEncoder}
+import org.apache.spark.sql.catalyst.encoders.{encoderFor, ExpressionEncoder}
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.plans.physical.AllTuples
 import org.apache.spark.sql.catalyst.streaming.StreamingRelationV2
 import org.apache.spark.sql.catalyst.util._
 import org.apache.spark.sql.connector.read.streaming.{Offset => OffsetV2, SparkDataStream}
-import org.apache.spark.sql.execution.datasources.v2.StreamingDataSourceV2Relation
+import org.apache.spark.sql.execution.datasources.v2.StreamingDataSourceV2ScanRelation
 import org.apache.spark.sql.execution.streaming._
 import org.apache.spark.sql.execution.streaming.continuous.{ContinuousExecution, EpochCoordinatorRef, IncrementAndGetEpoch}
 import org.apache.spark.sql.execution.streaming.sources.MemorySink
@@ -147,7 +147,7 @@ trait StreamTest extends QueryTest with SharedSparkSession with TimeLimits with 
   private def createToExternalRowConverter[A : Encoder](): A => Row = {
     val encoder = encoderFor[A]
     val toInternalRow = encoder.createSerializer()
-    val toExternalRow = RowEncoder(encoder.schema).resolveAndBind().createDeserializer()
+    val toExternalRow = ExpressionEncoder(encoder.schema).resolveAndBind().createDeserializer()
     toExternalRow.compose(toInternalRow)
   }
 
@@ -283,7 +283,7 @@ trait StreamTest extends QueryTest with SharedSparkSession with TimeLimits with 
 
   /** Assert that a condition on the active query is true */
   class AssertOnQuery(val condition: StreamExecution => Boolean, val message: String)
-    extends StreamAction {
+    extends StreamAction with StreamMustBeRunning {
     override def toString: String = s"AssertOnQuery(<condition>, $message)"
   }
 
@@ -341,7 +341,8 @@ trait StreamTest extends QueryTest with SharedSparkSession with TimeLimits with 
    */
   def testStream(
       _stream: Dataset[_],
-      outputMode: OutputMode = OutputMode.Append)(actions: StreamAction*): Unit = synchronized {
+      outputMode: OutputMode = OutputMode.Append,
+      extraOptions: Map[String, String] = Map.empty)(actions: StreamAction*): Unit = synchronized {
     import org.apache.spark.sql.streaming.util.StreamManualClock
 
     // `synchronized` is added to prevent the user from calling multiple `testStream`s concurrently
@@ -372,6 +373,7 @@ trait StreamTest extends QueryTest with SharedSparkSession with TimeLimits with 
       }
 
       override def onQueryProgress(event: QueryProgressEvent): Unit = {}
+      override def onQueryIdle(event: QueryIdleEvent): Unit = {}
       override def onQueryTerminated(event: QueryTerminatedEvent): Unit = {}
     }
     sparkSession.streams.addListener(listener)
@@ -456,7 +458,7 @@ trait StreamTest extends QueryTest with SharedSparkSession with TimeLimits with 
         }
       }
       val c = Option(cause).map(exceptionToString(_))
-      val m = if (message != null && message.size > 0) Some(message) else None
+      val m = if (message != null && message.length > 0) Some(message) else None
       fail(
         s"""
            |${(m ++ c).mkString(": ")}
@@ -528,8 +530,10 @@ trait StreamTest extends QueryTest with SharedSparkSession with TimeLimits with 
           verify(triggerClock.isInstanceOf[SystemClock]
             || triggerClock.isInstanceOf[StreamManualClock],
             "Use either SystemClock or StreamManualClock to start the stream")
-          if (triggerClock.isInstanceOf[StreamManualClock]) {
-            manualClockExpectedTime = triggerClock.asInstanceOf[StreamManualClock].getTimeMillis()
+          triggerClock match {
+            case clock: StreamManualClock =>
+              manualClockExpectedTime = clock.getTimeMillis()
+            case _ =>
           }
           val metadataRoot = Option(checkpointLocation).getOrElse(defaultCheckpointLocation)
 
@@ -550,7 +554,7 @@ trait StreamTest extends QueryTest with SharedSparkSession with TimeLimits with 
                 None,
                 Some(metadataRoot),
                 stream,
-                Map(),
+                extraOptions,
                 sink,
                 outputMode,
                 trigger = trigger,
@@ -698,7 +702,7 @@ trait StreamTest extends QueryTest with SharedSparkSession with TimeLimits with 
                   // v1 source
                   case r: StreamingExecutionRelation => r.source
                   // v2 source
-                  case r: StreamingDataSourceV2Relation => r.stream
+                  case r: StreamingDataSourceV2ScanRelation => r.stream
                   // We can add data to memory stream before starting it. Then the input plan has
                   // not been processed by the streaming engine and contains `StreamingRelationV2`.
                   case r: StreamingRelationV2 if r.sourceName == "memory" =>
@@ -871,6 +875,10 @@ trait StreamTest extends QueryTest with SharedSparkSession with TimeLimits with 
 
           case r if r < 0.7 => // AddData
             addRandomData()
+            // In some suites, e.g. `KafkaSourceStressSuite`, we delete Kafka topic in the
+            // `addData` closure. In the case, the topic with added data might be deleted
+            // before next check. So we must check data after adding data here.
+            addCheck()
 
           case _ => // StopStream
             addCheck()

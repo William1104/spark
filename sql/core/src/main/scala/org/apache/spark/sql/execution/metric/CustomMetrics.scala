@@ -17,20 +17,22 @@
 
 package org.apache.spark.sql.execution.metric
 
-import java.text.NumberFormat
-import java.util.Locale
-
-import org.apache.spark.sql.connector.CustomMetric
+import org.apache.spark.TaskContext
+import org.apache.spark.sql.connector.metric.{CustomMetric, CustomTaskMetric}
 
 object CustomMetrics {
   private[spark] val V2_CUSTOM = "v2Custom"
+
+  private[spark] val NUM_ROWS_PER_UPDATE = 100
+
+  private[spark] val BUILTIN_OUTPUT_METRICS = Set("bytesWritten", "recordsWritten")
 
   /**
    * Given a class name, builds and returns a metric type for a V2 custom metric class
    * `CustomMetric`.
    */
   def buildV2CustomMetricTypeName(customMetric: CustomMetric): String = {
-    s"${V2_CUSTOM}_${customMetric.getClass.getCanonicalName}"
+    s"${V2_CUSTOM}_${customMetric.getClass.getName}"
   }
 
   /**
@@ -44,36 +46,28 @@ object CustomMetrics {
       None
     }
   }
-}
 
-/**
- * Built-in `CustomMetric` that sums up metric values.
- */
-class CustomSumMetric extends CustomMetric {
-  override def name(): String = "CustomSumMetric"
+  /**
+   * Updates given custom metrics. If `currentMetricsValues` has metric which does not exist
+   * in `customMetrics` map, it is non-op.
+   */
+  def updateMetrics(
+      currentMetricsValues: Seq[CustomTaskMetric],
+      customMetrics: Map[String, SQLMetric]): Unit = {
+    currentMetricsValues.foreach { metric =>
+      val metricName = metric.name()
+      val metricValue = metric.value()
+      customMetrics.get(metricName).foreach(_.set(metricValue))
 
-  override def description(): String = "Sum up CustomMetric"
-
-  override def aggregateTaskMetrics(taskMetrics: Array[Long]): String = {
-    taskMetrics.sum.toString
-  }
-}
-
-/**
- * Built-in `CustomMetric` that computes average of metric values.
- */
-class CustomAvgMetric extends CustomMetric {
-  override def name(): String = "CustomAvgMetric"
-
-  override def description(): String = "Average CustomMetric"
-
-  override def aggregateTaskMetrics(taskMetrics: Array[Long]): String = {
-    val average = if (taskMetrics.isEmpty) {
-      0.0
-    } else {
-      taskMetrics.sum.toDouble / taskMetrics.length
+      if (BUILTIN_OUTPUT_METRICS.contains(metricName)) {
+        Option(TaskContext.get()).map(_.taskMetrics().outputMetrics).foreach { outputMetrics =>
+          metricName match {
+            case "bytesWritten" => outputMetrics.setBytesWritten(metricValue)
+            case "recordsWritten" => outputMetrics.setRecordsWritten(metricValue)
+            case _ => // no-op
+          }
+        }
+      }
     }
-    val numberFormat = NumberFormat.getNumberInstance(Locale.US)
-    numberFormat.format(average)
   }
 }

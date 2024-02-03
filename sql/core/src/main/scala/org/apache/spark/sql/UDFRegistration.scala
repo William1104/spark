@@ -31,6 +31,7 @@ import org.apache.spark.sql.catalyst.analysis.FunctionRegistry
 import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
 import org.apache.spark.sql.catalyst.expressions.{Expression, ScalaUDF}
 import org.apache.spark.sql.catalyst.util.CharVarcharUtils
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.aggregate.ScalaUDAF
 import org.apache.spark.sql.execution.python.UserDefinedPythonFunction
 import org.apache.spark.sql.expressions.{SparkUserDefinedFunction, UserDefinedAggregateFunction, UserDefinedAggregator, UserDefinedFunction}
@@ -56,7 +57,7 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
       s"""
         | Registering new PythonUDF:
         | name: $name
-        | command: ${udf.func.command.toSeq}
+        | command: ${udf.func.command}
         | envVars: ${udf.func.envVars}
         | pythonIncludes: ${udf.func.pythonIncludes}
         | pythonExec: ${udf.func.pythonExec}
@@ -65,7 +66,7 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
         | udfDeterministic: ${udf.udfDeterministic}
       """.stripMargin)
 
-    functionRegistry.createOrReplaceTempFunction(name, udf.builder)
+    functionRegistry.createOrReplaceTempFunction(name, udf.builder, "python_udf")
   }
 
   /**
@@ -83,7 +84,7 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     " via the functions.udaf(agg) method.", "3.0.0")
   def register(name: String, udaf: UserDefinedAggregateFunction): UserDefinedAggregateFunction = {
     def builder(children: Seq[Expression]) = ScalaUDAF(children, udaf, udafName = Some(name))
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     udaf
   }
 
@@ -112,11 +113,11 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     udf.withName(name) match {
       case udaf: UserDefinedAggregator[_, _, _] =>
         def builder(children: Seq[Expression]) = udaf.scalaAggregator(children)
-        functionRegistry.createOrReplaceTempFunction(name, builder)
+        functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
         udaf
       case other =>
         def builder(children: Seq[Expression]) = other.apply(children.map(Column.apply) : _*).expr
-        functionRegistry.createOrReplaceTempFunction(name, builder)
+        functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
         other
     }
   }
@@ -144,10 +145,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
         |  def builder(e: Seq[Expression]) = if (e.length == $x) {
         |    finalUdf.createScalaUDF(e)
         |  } else {
-        |    throw new AnalysisException("Invalid number of arguments for function " + name +
-        |      ". Expected: $x; Found: " + e.length)
+        |    throw QueryCompilationErrors.wrongNumArgsError(name, "$x", e.length)
         |  }
-        |  functionRegistry.createOrReplaceTempFunction(name, builder)
+        |  functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
         |  finalUdf
         |}""".stripMargin)
     }
@@ -170,10 +170,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
         |  def builder(e: Seq[Expression]) = if (e.length == $i) {
         |    ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
         |  } else {
-        |    throw new AnalysisException("Invalid number of arguments for function " + name +
-        |      ". Expected: $i; Found: " + e.length)
+        |    throw QueryCompilationErrors.wrongNumArgsError(name, "$i", e.length)
         |  }
-        |  functionRegistry.createOrReplaceTempFunction(name, builder)
+        |  functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
         |}""".stripMargin)
     }
     */
@@ -192,10 +191,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 0) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 0; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "0", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -213,10 +211,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 1) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 1; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "1", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -234,10 +231,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 2) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 2; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "2", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -255,10 +251,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 3) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 3; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "3", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -276,10 +271,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 4) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 4; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "4", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -297,10 +291,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 5) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 5; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "5", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -318,10 +311,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 6) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 6; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "6", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -339,10 +331,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 7) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 7; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "7", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -360,10 +351,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 8) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 8; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "8", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -381,10 +371,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 9) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 9; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "9", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -402,10 +391,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 10) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 10; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "10", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -423,10 +411,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 11) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 11; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "11", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -444,10 +431,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 12) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 12; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "12", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -465,10 +451,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 13) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 13; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "13", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -486,10 +471,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 14) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 14; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "14", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -507,10 +491,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 15) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 15; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "15", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -528,10 +511,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 16) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 16; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "16", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -549,10 +531,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 17) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 17; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "17", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -570,10 +551,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 18) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 18; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "18", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -591,10 +571,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 19) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 19; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "19", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -612,10 +591,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 20) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 20; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "20", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -633,10 +611,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 21) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 21; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "21", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -654,10 +631,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 22) {
       finalUdf.createScalaUDF(e)
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 22; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "22", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "scala_udf")
     finalUdf
   }
 
@@ -681,9 +657,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
         .map(_.asInstanceOf[ParameterizedType])
         .filter(e => e.getRawType.isInstanceOf[Class[_]] && e.getRawType.asInstanceOf[Class[_]].getCanonicalName.startsWith("org.apache.spark.sql.api.java.UDF"))
       if (udfInterfaces.length == 0) {
-        throw new AnalysisException(s"UDF class $className doesn't implement any UDF interface")
+        throw QueryCompilationErrors.udfClassDoesNotImplementAnyUDFInterfaceError(className)
       } else if (udfInterfaces.length > 1) {
-        throw new AnalysisException(s"It is invalid to implement multiple UDF interfaces, UDF class $className")
+        throw QueryCompilationErrors.udfClassImplementMultiUDFInterfacesError(className)
       } else {
         try {
           val udf = clazz.getConstructor().newInstance()
@@ -718,15 +694,15 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
             case 22 => register(name, udf.asInstanceOf[UDF21[_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _]], returnType)
             case 23 => register(name, udf.asInstanceOf[UDF22[_, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _, _]], returnType)
             case n =>
-              throw new AnalysisException(s"UDF class with $n type arguments is not supported.")
+              throw QueryCompilationErrors.udfClassWithTooManyTypeArgumentsError(n)
           }
         } catch {
           case e @ (_: InstantiationException | _: IllegalArgumentException) =>
-            throw new AnalysisException(s"Can not instantiate class $className, please make sure it has public non argument constructor")
+            throw QueryCompilationErrors.classWithoutPublicNonArgumentConstructorError(className)
         }
       }
     } catch {
-      case e: ClassNotFoundException => throw new AnalysisException(s"Can not load class $className, please make sure it is on the classpath")
+      case e: ClassNotFoundException => throw QueryCompilationErrors.cannotLoadClassNotOnClassPathError(className)
     }
 
   }
@@ -741,14 +717,14 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     try {
       val clazz = Utils.classForName[AnyRef](className)
       if (!classOf[UserDefinedAggregateFunction].isAssignableFrom(clazz)) {
-        throw new AnalysisException(s"class $className doesn't implement interface UserDefinedAggregateFunction")
+        throw QueryCompilationErrors.classDoesNotImplementUserDefinedAggregateFunctionError(className)
       }
       val udaf = clazz.getConstructor().newInstance().asInstanceOf[UserDefinedAggregateFunction]
       register(name, udaf)
     } catch {
-      case e: ClassNotFoundException => throw new AnalysisException(s"Can not load class ${className}, please make sure it is on the classpath")
+      case e: ClassNotFoundException => throw QueryCompilationErrors.cannotLoadClassNotOnClassPathError(className)
       case e @ (_: InstantiationException | _: IllegalArgumentException) =>
-        throw new AnalysisException(s"Can not instantiate class ${className}, please make sure it has public non argument constructor")
+        throw QueryCompilationErrors.classWithoutPublicNonArgumentConstructorError(className)
     }
   }
 
@@ -762,10 +738,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 0) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 0; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "0", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -778,10 +753,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 1) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 1; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "1", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -794,10 +768,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 2) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 2; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "2", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -810,10 +783,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 3) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 3; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "3", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -826,10 +798,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 4) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 4; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "4", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -842,10 +813,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 5) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 5; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "5", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -858,10 +828,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 6) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 6; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "6", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -874,10 +843,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 7) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 7; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "7", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -890,10 +858,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 8) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 8; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "8", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -906,10 +873,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 9) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 9; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "9", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -922,10 +888,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 10) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 10; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "10", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -938,10 +903,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 11) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 11; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "11", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -954,10 +918,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 12) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 12; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "12", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -970,10 +933,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 13) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 13; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "13", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -986,10 +948,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 14) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 14; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "14", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -1002,10 +963,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 15) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 15; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "15", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -1018,10 +978,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 16) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 16; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "16", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -1034,10 +993,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 17) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 17; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "17", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -1050,10 +1008,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 18) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 18; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "18", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -1066,10 +1023,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 19) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 19; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "19", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -1082,10 +1038,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 20) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 20; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "20", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -1098,10 +1053,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 21) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 21; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "21", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   /**
@@ -1114,10 +1068,9 @@ class UDFRegistration private[sql] (functionRegistry: FunctionRegistry) extends 
     def builder(e: Seq[Expression]) = if (e.length == 22) {
       ScalaUDF(func, replaced, e, Nil, udfName = Some(name))
     } else {
-      throw new AnalysisException("Invalid number of arguments for function " + name +
-        ". Expected: 22; Found: " + e.length)
+      throw QueryCompilationErrors.wrongNumArgsError(name, "22", e.length)
     }
-    functionRegistry.createOrReplaceTempFunction(name, builder)
+    functionRegistry.createOrReplaceTempFunction(name, builder, "java_udf")
   }
 
   // scalastyle:on line.size.limit

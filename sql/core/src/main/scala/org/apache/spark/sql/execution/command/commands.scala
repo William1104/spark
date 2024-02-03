@@ -17,7 +17,7 @@
 
 package org.apache.spark.sql.execution.command
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
 import org.apache.spark.rdd.RDD
@@ -28,11 +28,12 @@ import org.apache.spark.sql.catalyst.plans.QueryPlan
 import org.apache.spark.sql.catalyst.plans.logical.{Command, LogicalPlan}
 import org.apache.spark.sql.catalyst.trees.LeafLike
 import org.apache.spark.sql.connector.ExternalCommandRunner
-import org.apache.spark.sql.execution.{ExplainMode, LeafExecNode, SparkPlan, UnaryExecNode}
+import org.apache.spark.sql.execution.{CommandExecutionMode, ExplainMode, LeafExecNode, SparkPlan, UnaryExecNode}
 import org.apache.spark.sql.execution.metric.SQLMetric
 import org.apache.spark.sql.execution.streaming.IncrementalExecution
 import org.apache.spark.sql.types._
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * A logical command that is executed for its side-effects.  `RunnableCommand`s are
@@ -72,7 +73,7 @@ case class ExecutedCommandExec(cmd: RunnableCommand) extends LeafExecNode {
    */
   protected[sql] lazy val sideEffectResult: Seq[InternalRow] = {
     val converter = CatalystTypeConverters.createToCatalystConverter(schema)
-    cmd.run(sqlContext.sparkSession).map(converter(_).asInstanceOf[InternalRow])
+    cmd.run(session).map(converter(_).asInstanceOf[InternalRow])
   }
 
   override def innerChildren: Seq[QueryPlan[_]] = cmd :: Nil
@@ -83,7 +84,7 @@ case class ExecutedCommandExec(cmd: RunnableCommand) extends LeafExecNode {
 
   override def executeCollect(): Array[InternalRow] = sideEffectResult.toArray
 
-  override def executeToIterator(): Iterator[InternalRow] = sideEffectResult.toIterator
+  override def executeToIterator(): Iterator[InternalRow] = sideEffectResult.iterator
 
   override def executeTake(limit: Int): Array[InternalRow] = sideEffectResult.take(limit).toArray
 
@@ -92,7 +93,7 @@ case class ExecutedCommandExec(cmd: RunnableCommand) extends LeafExecNode {
   }
 
   protected override def doExecute(): RDD[InternalRow] = {
-    sqlContext.sparkContext.parallelize(sideEffectResult, 1)
+    sparkContext.parallelize(sideEffectResult, 1)
   }
 }
 
@@ -110,7 +111,7 @@ case class DataWritingCommandExec(cmd: DataWritingCommand, child: SparkPlan)
 
   protected[sql] lazy val sideEffectResult: Seq[InternalRow] = {
     val converter = CatalystTypeConverters.createToCatalystConverter(schema)
-    val rows = cmd.run(sqlContext.sparkSession, child)
+    val rows = cmd.run(session, child)
 
     rows.map(converter(_).asInstanceOf[InternalRow])
   }
@@ -124,7 +125,7 @@ case class DataWritingCommandExec(cmd: DataWritingCommand, child: SparkPlan)
 
   override def executeCollect(): Array[InternalRow] = sideEffectResult.toArray
 
-  override def executeToIterator(): Iterator[InternalRow] = sideEffectResult.toIterator
+  override def executeToIterator(): Iterator[InternalRow] = sideEffectResult.iterator
 
   override def executeTake(limit: Int): Array[InternalRow] = sideEffectResult.take(limit).toArray
 
@@ -133,7 +134,7 @@ case class DataWritingCommandExec(cmd: DataWritingCommand, child: SparkPlan)
   }
 
   protected override def doExecute(): RDD[InternalRow] = {
-    sqlContext.sparkContext.parallelize(sideEffectResult, 1)
+    sparkContext.parallelize(sideEffectResult, 1)
   }
 
   override protected def withNewChildInternal(newChild: SparkPlan): DataWritingCommandExec =
@@ -163,10 +164,12 @@ case class ExplainCommand(
 
   // Run through the optimizer to generate the physical plan.
   override def run(sparkSession: SparkSession): Seq[Row] = try {
-    val outputString = sparkSession.sessionState.executePlan(logicalPlan).explainString(mode)
+    val outputString = sparkSession.sessionState.executePlan(logicalPlan, CommandExecutionMode.SKIP)
+      .explainString(mode)
     Seq(Row(outputString))
   } catch { case NonFatal(cause) =>
-    ("Error occurred during query planning: \n" + cause.getMessage).split("\n").map(Row(_))
+    ("Error occurred during query planning: \n" + cause.getMessage).split("\n")
+      .map(Row(_)).toImmutableArraySeq
   }
 }
 
@@ -188,7 +191,8 @@ case class StreamingExplainCommand(
       }
     Seq(Row(outputString))
   } catch { case NonFatal(cause) =>
-    ("Error occurred during query planning: \n" + cause.getMessage).split("\n").map(Row(_))
+    ("Error occurred during query planning: \n" + cause.getMessage).split("\n")
+      .map(Row(_)).toImmutableArraySeq
   }
 }
 
@@ -206,6 +210,6 @@ case class ExternalCommandExecutor(
 
   override def run(sparkSession: SparkSession): Seq[Row] = {
     val output = runner.executeCommand(command, new CaseInsensitiveStringMap(options.asJava))
-    output.map(Row(_))
+    output.map(Row(_)).toImmutableArraySeq
   }
 }

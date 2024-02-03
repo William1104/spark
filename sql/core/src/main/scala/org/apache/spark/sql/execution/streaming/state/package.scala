@@ -35,27 +35,28 @@ package object state {
         stateInfo: StatefulOperatorStateInfo,
         keySchema: StructType,
         valueSchema: StructType,
-        indexOrdinal: Option[Int])(
+        numColsPrefixKey: Int)(
         storeUpdateFunction: (StateStore, Iterator[T]) => Iterator[U]): StateStoreRDD[T, U] = {
 
       mapPartitionsWithStateStore(
         stateInfo,
         keySchema,
         valueSchema,
-        indexOrdinal,
+        numColsPrefixKey,
         sqlContext.sessionState,
         Some(sqlContext.streams.stateStoreCoordinator))(
         storeUpdateFunction)
     }
 
     /** Map each partition of an RDD along with data in a [[StateStore]]. */
-    private[streaming] def mapPartitionsWithStateStore[U: ClassTag](
+    def mapPartitionsWithStateStore[U: ClassTag](
         stateInfo: StatefulOperatorStateInfo,
         keySchema: StructType,
         valueSchema: StructType,
-        indexOrdinal: Option[Int],
+        numColsPrefixKey: Int,
         sessionState: SessionState,
         storeCoordinator: Option[StateStoreCoordinatorRef],
+        useColumnFamilies: Boolean = false,
         extraOptions: Map[String, String] = Map.empty)(
         storeUpdateFunction: (StateStore, Iterator[T]) => Iterator[U]): StateStoreRDD[T, U] = {
 
@@ -77,9 +78,10 @@ package object state {
         stateInfo.storeVersion,
         keySchema,
         valueSchema,
-        indexOrdinal,
+        numColsPrefixKey,
         sessionState,
         storeCoordinator,
+        useColumnFamilies,
         extraOptions)
     }
 
@@ -88,9 +90,10 @@ package object state {
         stateInfo: StatefulOperatorStateInfo,
         keySchema: StructType,
         valueSchema: StructType,
-        indexOrdinal: Option[Int],
+        numColsPrefixKey: Int,
         sessionState: SessionState,
         storeCoordinator: Option[StateStoreCoordinatorRef],
+        useColumnFamilies: Boolean = false,
         extraOptions: Map[String, String] = Map.empty)(
         storeReadFn: (ReadStateStore, Iterator[T]) => Iterator[U])
       : ReadStateStoreRDD[T, U] = {
@@ -112,9 +115,10 @@ package object state {
         stateInfo.storeVersion,
         keySchema,
         valueSchema,
-        indexOrdinal,
+        numColsPrefixKey,
         sessionState,
         storeCoordinator,
+        useColumnFamilies,
         extraOptions)
     }
   }

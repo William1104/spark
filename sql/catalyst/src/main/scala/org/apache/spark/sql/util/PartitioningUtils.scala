@@ -17,16 +17,50 @@
 
 package org.apache.spark.sql.util
 
-import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.analysis.Resolver
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
 import org.apache.spark.sql.catalyst.catalog.ExternalCatalogUtils.DEFAULT_PARTITION_NAME
+import org.apache.spark.sql.catalyst.expressions.{Cast, Expression, Literal}
 import org.apache.spark.sql.catalyst.util.CharVarcharCodegenUtils
 import org.apache.spark.sql.catalyst.util.CharVarcharUtils
-import org.apache.spark.sql.types.{CharType, StructType, VarcharType}
+import org.apache.spark.sql.errors.QueryCompilationErrors
+import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.sql.internal.SQLConf.StoreAssignmentPolicy
+import org.apache.spark.sql.types.{CharType, DataType, StringType, StructField, StructType, VarcharType}
 import org.apache.spark.unsafe.types.UTF8String
 
 private[sql] object PartitioningUtils {
+
+  def castPartitionSpec(value: String, dt: DataType, conf: SQLConf): Expression = {
+    conf.storeAssignmentPolicy match {
+      // SPARK-30844: try our best to follow StoreAssignmentPolicy for static partition
+      // values but not completely follow because we can't do static type checking due to
+      // the reason that the parser has erased the type info of static partition values
+      // and converted them to string.
+      case StoreAssignmentPolicy.ANSI | StoreAssignmentPolicy.STRICT =>
+        val cast = Cast(Literal(value), dt, Option(conf.sessionLocalTimeZone),
+          ansiEnabled = true)
+        cast.setTagValue(Cast.BY_TABLE_INSERTION, ())
+        cast
+      case _ =>
+        Cast(Literal(value), dt, Option(conf.sessionLocalTimeZone),
+          ansiEnabled = false)
+    }
+  }
+
+  private def normalizePartitionStringValue(value: String, field: StructField): String = {
+    val casted = Cast(
+      castPartitionSpec(value, field.dataType, SQLConf.get),
+      StringType,
+      Option(SQLConf.get.sessionLocalTimeZone)
+    ).eval()
+    if (casted != null) {
+      casted.asInstanceOf[UTF8String].toString
+    } else {
+      null
+    }
+  }
+
   /**
    * Normalize the column names in partition specification, w.r.t. the real partition column names
    * and case sensitivity. e.g., if the partition spec has a column named `monTh`, and there is a
@@ -38,34 +72,42 @@ private[sql] object PartitioningUtils {
       partCols: StructType,
       tblName: String,
       resolver: Resolver): Map[String, T] = {
-    val rawSchema = CharVarcharUtils.getRawSchema(partCols)
+    val rawSchema = CharVarcharUtils.getRawSchema(partCols, SQLConf.get)
     val normalizedPartSpec = partitionSpec.toSeq.map { case (key, value) =>
       val normalizedFiled = rawSchema.find(f => resolver(f.name, key)).getOrElse {
-        throw new AnalysisException(s"$key is not a valid partition column in table $tblName.")
+        throw QueryCompilationErrors.invalidPartitionColumnKeyInTableError(key, tblName)
       }
 
-      val normalizedVal = normalizedFiled.dataType match {
-        case CharType(len) if value != null && value != DEFAULT_PARTITION_NAME =>
-          val v = value match {
-            case Some(str: String) => Some(charTypeWriteSideCheck(str, len))
-            case str: String => charTypeWriteSideCheck(str, len)
-            case other => other
-          }
-          v.asInstanceOf[T]
-        case VarcharType(len) if value != null && value != DEFAULT_PARTITION_NAME =>
-          val v = value match {
-            case Some(str: String) => Some(varcharTypeWriteSideCheck(str, len))
-            case str: String => varcharTypeWriteSideCheck(str, len)
-            case other => other
-          }
-          v.asInstanceOf[T]
-        case _ => value
-      }
+      val normalizedVal =
+        if (SQLConf.get.charVarcharAsString) value else normalizedFiled.dataType match {
+          case CharType(len) if value != null && value != DEFAULT_PARTITION_NAME =>
+            val v = value match {
+              case Some(str: String) => Some(charTypeWriteSideCheck(str, len))
+              case str: String => charTypeWriteSideCheck(str, len)
+              case other => other
+            }
+            v.asInstanceOf[T]
+          case VarcharType(len) if value != null && value != DEFAULT_PARTITION_NAME =>
+            val v = value match {
+              case Some(str: String) => Some(varcharTypeWriteSideCheck(str, len))
+              case str: String => varcharTypeWriteSideCheck(str, len)
+              case other => other
+            }
+            v.asInstanceOf[T]
+          case _ if !SQLConf.get.getConf(SQLConf.SKIP_TYPE_VALIDATION_ON_ALTER_PARTITION) &&
+              value != null && value != DEFAULT_PARTITION_NAME =>
+            val v = value match {
+              case Some(str: String) => Some(normalizePartitionStringValue(str, normalizedFiled))
+              case str: String => normalizePartitionStringValue(str, normalizedFiled)
+              case other => other
+            }
+            v.asInstanceOf[T]
+          case _ => value
+        }
       normalizedFiled.name -> normalizedVal
     }
 
-    SchemaUtils.checkColumnNameDuplication(
-      normalizedPartSpec.map(_._1), "in the partition schema", resolver)
+    SchemaUtils.checkColumnNameDuplication(normalizedPartSpec.map(_._1), resolver)
 
     normalizedPartSpec.toMap
   }
@@ -90,10 +132,8 @@ private[sql] object PartitioningUtils {
       partitionColumnNames: Seq[String]): Unit = {
     val defined = partitionColumnNames.sorted
     if (spec.keys.toSeq.sorted != defined) {
-      throw new AnalysisException(
-        s"Partition spec is invalid. The spec (${spec.keys.mkString(", ")}) must match " +
-        s"the partition spec (${partitionColumnNames.mkString(", ")}) defined in " +
-        s"table '$tableName'")
+      throw QueryCompilationErrors.invalidPartitionSpecError(spec.keys.mkString(", "),
+        partitionColumnNames, tableName)
     }
   }
 }

@@ -22,17 +22,21 @@ import java.time.{Duration, Instant, LocalDate, LocalDateTime, Period, ZoneOffse
 import java.time.temporal.ChronoUnit
 import java.util.TimeZone
 
+import scala.collection.mutable
 import scala.reflect.runtime.universe.TypeTag
 
-import org.apache.spark.SparkFunSuite
+import org.apache.spark.{SparkException, SparkFunSuite}
 import org.apache.spark.sql.Row
 import org.apache.spark.sql.catalyst.{CatalystTypeConverters, ScalaReflection}
 import org.apache.spark.sql.catalyst.encoders.ExamplePointUDT
 import org.apache.spark.sql.catalyst.util.DateTimeConstants._
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
+import org.apache.spark.sql.catalyst.util.TypeUtils.toSQLType
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
-import org.apache.spark.unsafe.types.CalendarInterval
+import org.apache.spark.sql.types.DayTimeIntervalType._
+import org.apache.spark.sql.types.YearMonthIntervalType._
+import org.apache.spark.unsafe.types.{CalendarInterval, UTF8String}
 
 class LiteralExpressionSuite extends SparkFunSuite with ExpressionEvalHelper {
 
@@ -50,8 +54,8 @@ class LiteralExpressionSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkEvaluation(Literal.create(null, DateType), null)
     checkEvaluation(Literal.create(null, TimestampType), null)
     checkEvaluation(Literal.create(null, CalendarIntervalType), null)
-    checkEvaluation(Literal.create(null, YearMonthIntervalType), null)
-    checkEvaluation(Literal.create(null, DayTimeIntervalType), null)
+    checkEvaluation(Literal.create(null, YearMonthIntervalType()), null)
+    checkEvaluation(Literal.create(null, DayTimeIntervalType()), null)
     checkEvaluation(Literal.create(null, ArrayType(ByteType, true)), null)
     checkEvaluation(Literal.create(null, ArrayType(StringType, true)), null)
     checkEvaluation(Literal.create(null, MapType(StringType, IntegerType)), null)
@@ -79,13 +83,24 @@ class LiteralExpressionSuite extends SparkFunSuite with ExpressionEvalHelper {
       checkEvaluation(Literal.default(TimestampType), Instant.ofEpochSecond(0))
     }
     checkEvaluation(Literal.default(CalendarIntervalType), new CalendarInterval(0, 0, 0L))
-    checkEvaluation(Literal.default(YearMonthIntervalType), 0)
-    checkEvaluation(Literal.default(DayTimeIntervalType), 0L)
+    checkEvaluation(Literal.default(YearMonthIntervalType()), 0)
+    checkEvaluation(Literal.default(DayTimeIntervalType()), 0L)
     checkEvaluation(Literal.default(ArrayType(StringType)), Array())
     checkEvaluation(Literal.default(MapType(IntegerType, StringType)), Map())
     checkEvaluation(Literal.default(StructType(StructField("a", StringType) :: Nil)), Row(""))
     // ExamplePointUDT.sqlType is ArrayType(DoubleType, false).
     checkEvaluation(Literal.default(new ExamplePointUDT), Array())
+
+    // DateType without default value`
+    List(CharType(1), VarcharType(1)).foreach(errType => {
+      checkError(
+        exception = intercept[SparkException] {
+          Literal.default(errType)
+        },
+        errorClass = "INTERNAL_ERROR",
+        parameters = Map("message" -> s"No default value for type: ${toSQLType(errType)}.")
+      )
+    })
   }
 
   test("boolean literals") {
@@ -193,7 +208,7 @@ class LiteralExpressionSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkArrayLiteral(Array("a", "b", "c"))
     checkArrayLiteral(Array(1.0, 4.0))
     checkArrayLiteral(Array(new CalendarInterval(1, 0, 0), new CalendarInterval(0, 1, 0)))
-    val arr = collection.mutable.WrappedArray.make(Array(1.0, 4.0))
+    val arr = mutable.ArraySeq.make(Array(1.0, 4.0))
     checkEvaluation(Literal(arr), toCatalyst(arr))
   }
 
@@ -229,17 +244,6 @@ class LiteralExpressionSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkStructLiteral((Period.ZERO, ("abc", Duration.ofDays(1))))
   }
 
-  test("unsupported types (map and struct) in Literal.apply") {
-    def checkUnsupportedTypeInLiteral(v: Any): Unit = {
-      val errMsgMap = intercept[RuntimeException] {
-        Literal(v)
-      }
-      assert(errMsgMap.getMessage.startsWith("Unsupported literal type"))
-    }
-    checkUnsupportedTypeInLiteral(Map("key1" -> 1, "key2" -> 2))
-    checkUnsupportedTypeInLiteral(("mike", 29, 1.0))
-  }
-
   test("SPARK-24571: char literals") {
     checkEvaluation(Literal('X'), "X")
     checkEvaluation(Literal.create('0'), "0")
@@ -254,6 +258,10 @@ class LiteralExpressionSuite extends SparkFunSuite with ExpressionEvalHelper {
     checkEvaluation(Literal(Array('测','试')), "测试")
     checkEvaluation(Literal(Array('a', '测', 'b', '试', 'c')), "a测b试c")
     // scalastyle:on
+  }
+
+  test("SPARK-39052: Support Char in Literal.create") {
+    checkEvaluation(Literal.create('a', StringType), "a")
   }
 
   test("construct literals from java.time.LocalDate") {
@@ -345,7 +353,7 @@ class LiteralExpressionSuite extends SparkFunSuite with ExpressionEvalHelper {
     assert(Literal(Array("1", "2", "3")) ==
       Literal.create(Array("1", "2", "3"), ArrayType(StringType)))
     assert(Literal(Array(Period.ofMonths(1))) ==
-      Literal.create(Array(Period.ofMonths(1)), ArrayType(YearMonthIntervalType)))
+      Literal.create(Array(Period.ofMonths(1)), ArrayType(YearMonthIntervalType())))
   }
 
   test("SPARK-34342: Date/Timestamp toString") {
@@ -357,6 +365,26 @@ class LiteralExpressionSuite extends SparkFunSuite with ExpressionEvalHelper {
         .toInstant
       val literalStr = Literal.create(timestamp).toString
       assert(literalStr === "2021-02-03 17:50:03.456")
+    }
+  }
+
+  test("SPARK-36055: TimestampNTZ toString") {
+    assert(Literal.default(TimestampNTZType).toString === "1970-01-01 00:00:00")
+    withTimeZones(sessionTimeZone = "GMT+01:00", systemTimeZone = "GMT-08:00") {
+      val timestamp = LocalDateTime.of(2021, 2, 3, 16, 50, 3, 456000000)
+      val literalStr = Literal.create(timestamp).toString
+      assert(literalStr === "2021-02-03 16:50:03.456")
+    }
+  }
+
+  test("SPARK-35664: construct literals from java.time.LocalDateTime") {
+    Seq(
+      LocalDateTime.of(1, 1, 1, 0, 0, 0, 0),
+      LocalDateTime.of(2021, 5, 31, 23, 59, 59, 100),
+      LocalDateTime.of(2020, 2, 29, 23, 50, 57, 9999),
+      LocalDateTime.parse("9999-12-31T23:59:59.999999")
+    ).foreach { dateTime =>
+      checkEvaluation(Literal(dateTime), dateTime)
     }
   }
 
@@ -420,5 +448,60 @@ class LiteralExpressionSuite extends SparkFunSuite with ExpressionEvalHelper {
       assert(literal.sql === expected)
       assert(literal.toString === expected)
     }
+  }
+
+  test("SPARK-35871: Literal.create(value, dataType) should support fields") {
+    val period = Period.ofMonths(13)
+    DataTypeTestUtils.yearMonthIntervalTypes.foreach { dt =>
+      val result = dt.endField match {
+        case YEAR => 12
+        case MONTH => 13
+      }
+      checkEvaluation(Literal.create(period, dt), result)
+    }
+
+    val duration = Duration.ofSeconds(86400 + 3600 + 60 + 1)
+    DataTypeTestUtils.dayTimeIntervalTypes.foreach { dt =>
+      val result = dt.endField match {
+        case DAY => 86400000000L
+        case HOUR => 90000000000L
+        case MINUTE => 90060000000L
+        case SECOND => 90061000000L
+      }
+      checkEvaluation(Literal.create(duration, dt), result)
+    }
+  }
+
+  test("SPARK-37967: Literal.create support ObjectType") {
+    checkEvaluation(
+      Literal.create(UTF8String.fromString("Spark SQL"), ObjectType(classOf[UTF8String])),
+      UTF8String.fromString("Spark SQL"))
+  }
+
+  // A generic internal row that throws exception when accessing null values
+  class NullAccessForbiddenGenericInternalRow(override val values: Array[Any])
+    extends GenericInternalRow(values) {
+    override def get(ordinal: Int, dataType: DataType): AnyRef = {
+      if (values(ordinal) == null) {
+        throw new RuntimeException(s"Should not access null field at $ordinal!")
+      }
+      super.get(ordinal, dataType)
+    }
+  }
+
+  test("SPARK-46634: literal validation should not drill down to null fields") {
+    val exceptionInternalRow = new NullAccessForbiddenGenericInternalRow(Array(null, 1))
+    val schema = StructType.fromDDL("id INT, age INT")
+    // This should not fail because it should check whether the field is null before drilling down
+    Literal.validateLiteralValue(exceptionInternalRow, schema)
+  }
+
+  test("SPARK-46604: Literal support immutable ArraySeq") {
+    import org.apache.spark.util.ArrayImplicits._
+    val immArraySeq = Array(1.0, 4.0).toImmutableArraySeq
+    val expected = toCatalyst(immArraySeq)
+    checkEvaluation(Literal(immArraySeq), expected)
+    checkEvaluation(Literal.create(immArraySeq), expected)
+    checkEvaluation(Literal.create(immArraySeq, ArrayType(DoubleType)), expected)
   }
 }

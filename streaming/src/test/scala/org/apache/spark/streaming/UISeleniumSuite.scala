@@ -21,7 +21,6 @@ import scala.collection.mutable.Queue
 
 import org.openqa.selenium.WebDriver
 import org.openqa.selenium.htmlunit.HtmlUnitDriver
-import org.scalatest.BeforeAndAfterAll
 import org.scalatest.concurrent.Eventually._
 import org.scalatest.matchers.must.Matchers
 import org.scalatest.matchers.should.Matchers._
@@ -35,8 +34,7 @@ import org.apache.spark.ui.SparkUICssErrorHandler
 /**
  * Selenium tests for the Spark Streaming Web UI.
  */
-class UISeleniumSuite
-  extends SparkFunSuite with WebBrowser with Matchers with BeforeAndAfterAll with TestSuiteBase {
+class UISeleniumSuite extends SparkFunSuite with WebBrowser with Matchers with TestSuiteBase {
 
   implicit var webDriver: WebDriver = _
 
@@ -82,7 +80,7 @@ class UISeleniumSuite
       try {
         rdd.foreach { _ =>
           // Failing the task with id 15 to ensure only one task fails
-          if (TaskContext.get.taskAttemptId() % 15 == 0) {
+          if (TaskContext.get().taskAttemptId() % 15 == 0) {
             throw new RuntimeException("Oops")
           }
         }
@@ -99,7 +97,7 @@ class UISeleniumSuite
 
       val sparkUI = ssc.sparkContext.ui.get
 
-      sparkUI.getDelegatingHandlers.count(_.getContextPath.contains("/streaming")) should be (5)
+      sparkUI.getDelegatingHandlers.count(_.getContextPath().contains("/streaming")) should be (5)
 
       eventually(timeout(10.seconds), interval(50.milliseconds)) {
         go to (sparkUI.webUrl.stripSuffix("/"))
@@ -214,7 +212,7 @@ class UISeleniumSuite
 
       ssc.stop(false)
 
-      sparkUI.getDelegatingHandlers.count(_.getContextPath.contains("/streaming")) should be (0)
+      sparkUI.getDelegatingHandlers.count(_.getContextPath().contains("/streaming")) should be (0)
 
       eventually(timeout(10.seconds), interval(50.milliseconds)) {
         go to (sparkUI.webUrl.stripSuffix("/"))

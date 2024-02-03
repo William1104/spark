@@ -18,13 +18,12 @@
 package org.apache.spark.deploy
 
 import java.io.{ByteArrayOutputStream, File, PrintStream}
-import java.lang.reflect.InvocationTargetException
 import java.nio.charset.StandardCharsets
 import java.util.{List => JList}
 
-import scala.collection.JavaConverters._
 import scala.collection.mutable.{ArrayBuffer, HashMap}
 import scala.io.Source
+import scala.jdk.CollectionConverters._
 import scala.util.Try
 
 import org.apache.spark.{SparkConf, SparkException, SparkUserAppException}
@@ -41,7 +40,10 @@ import org.apache.spark.util.Utils
  */
 private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, String] = sys.env)
   extends SparkSubmitArgumentsParser with Logging {
-  var master: String = null
+  var maybeMaster: Option[String] = None
+  // Global defaults. These should be keep to minimum to avoid confusing behavior.
+  def master: String = maybeMaster.getOrElse("local[*]")
+  var maybeRemote: Option[String] = None
   var deployMode: String = null
   var executorMemory: String = null
   var executorCores: String = null
@@ -149,10 +151,13 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
    * Load arguments from environment variables, Spark properties etc.
    */
   private def loadEnvironmentArguments(): Unit = {
-    master = Option(master)
+    maybeMaster = maybeMaster
       .orElse(sparkProperties.get("spark.master"))
       .orElse(env.get("MASTER"))
-      .orNull
+    maybeRemote = maybeRemote
+      .orElse(sparkProperties.get("spark.remote"))
+      .orElse(env.get("SPARK_REMOTE"))
+
     driverExtraClassPath = Option(driverExtraClassPath)
       .orElse(sparkProperties.get(config.DRIVER_CLASS_PATH.key))
       .orNull
@@ -185,13 +190,13 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
     files = Option(files).orElse(sparkProperties.get(config.FILES.key)).orNull
     archives = Option(archives).orElse(sparkProperties.get(config.ARCHIVES.key)).orNull
     pyFiles = Option(pyFiles).orElse(sparkProperties.get(config.SUBMIT_PYTHON_FILES.key)).orNull
-    ivyRepoPath = sparkProperties.get("spark.jars.ivy").orNull
-    ivySettingsPath = sparkProperties.get("spark.jars.ivySettings")
-    packages = Option(packages).orElse(sparkProperties.get("spark.jars.packages")).orNull
+    ivyRepoPath = sparkProperties.get(config.JAR_IVY_REPO_PATH.key).orNull
+    ivySettingsPath = sparkProperties.get(config.JAR_IVY_SETTING_PATH.key)
+    packages = Option(packages).orElse(sparkProperties.get(config.JAR_PACKAGES.key)).orNull
     packagesExclusions = Option(packagesExclusions)
-      .orElse(sparkProperties.get("spark.jars.excludes")).orNull
+      .orElse(sparkProperties.get(config.JAR_PACKAGES_EXCLUSIONS.key)).orNull
     repositories = Option(repositories)
-      .orElse(sparkProperties.get("spark.jars.repositories")).orNull
+      .orElse(sparkProperties.get(config.JAR_REPOSITORIES.key)).orNull
     deployMode = Option(deployMode)
       .orElse(sparkProperties.get(config.SUBMIT_DEPLOY_MODE.key))
       .orElse(env.get("DEPLOY_MODE"))
@@ -200,18 +205,15 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
       .getOrElse(sparkProperties.get(config.EXECUTOR_INSTANCES.key).orNull)
     queue = Option(queue).orElse(sparkProperties.get("spark.yarn.queue")).orNull
     keytab = Option(keytab)
-      .orElse(sparkProperties.get("spark.kerberos.keytab"))
+      .orElse(sparkProperties.get(config.KEYTAB.key))
       .orElse(sparkProperties.get("spark.yarn.keytab"))
       .orNull
     principal = Option(principal)
-      .orElse(sparkProperties.get("spark.kerberos.principal"))
+      .orElse(sparkProperties.get(config.PRINCIPAL.key))
       .orElse(sparkProperties.get("spark.yarn.principal"))
       .orNull
     dynamicAllocationEnabled =
       sparkProperties.get(DYN_ALLOCATION_ENABLED.key).exists("true".equalsIgnoreCase)
-
-    // Global defaults. These should be keep to minimum to avoid confusing behavior.
-    master = Option(master).getOrElse("local[*]")
 
     // In YARN mode, app name can be set via SPARK_YARN_APP_NAME (see SPARK-5222)
     if (master.startsWith("yarn")) {
@@ -242,6 +244,10 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
     if (args.length == 0) {
       printUsageAndExit(-1)
     }
+    if (!sparkProperties.contains("spark.local.connect") &&
+        maybeRemote.isDefined && (maybeMaster.isDefined || deployMode != null)) {
+      error("Remote cannot be specified with master and/or deploy mode.")
+    }
     if (primaryResource == null) {
       error("Must specify a primary resource (JAR or Python or R file)")
     }
@@ -252,6 +258,9 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
     if (executorMemory != null
         && Try(JavaUtils.byteStringAsBytes(executorMemory)).getOrElse(-1L) <= 0) {
       error("Executor memory must be a positive number")
+    }
+    if (driverCores != null && Try(driverCores.toInt).getOrElse(-1) <= 0) {
+      error("Driver cores must be a positive number")
     }
     if (executorCores != null && Try(executorCores.toInt).getOrElse(-1) <= 0) {
       error("Executor cores must be a positive number")
@@ -296,6 +305,7 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
   override def toString: String = {
     s"""Parsed arguments:
     |  master                  $master
+    |  remote                  ${maybeRemote.orNull}
     |  deployMode              $deployMode
     |  executorMemory          $executorMemory
     |  executorCores           $executorCores
@@ -324,7 +334,7 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
     |
     |Spark properties used, including those specified through
     | --conf and those from the properties file $propertiesFile:
-    |${Utils.redact(sparkProperties).mkString("  ", "\n  ", "\n")}
+    |${Utils.redact(sparkProperties).sorted.mkString("  ", "\n  ", "\n")}
     """.stripMargin
   }
 
@@ -335,7 +345,10 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
         name = value
 
       case MASTER =>
-        master = value
+        maybeMaster = Option(value)
+
+      case REMOTE =>
+        maybeRemote = Option(value)
 
       case CLASS =>
         mainClass = value
@@ -489,7 +502,7 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
     logInfo(
       s"""
         |Options:
-        |  --master MASTER_URL         spark://host:port, mesos://host:port, yarn,
+        |  --master MASTER_URL         spark://host:port, yarn,
         |                              k8s://https://host:port, or local (Default: local[*]).
         |  --deploy-mode DEPLOY_MODE   Whether to launch the driver program locally ("client") or
         |                              on one of the worker machines inside the cluster ("cluster")
@@ -536,18 +549,24 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
         |  --verbose, -v               Print additional debug output.
         |  --version,                  Print the version of current Spark.
         |
+        | Spark Connect only:
+        |   --remote CONNECT_URL       URL to connect to the server for Spark Connect, e.g.,
+        |                              sc://host:port. --master and --deploy-mode cannot be set
+        |                              together with this option. This option is experimental, and
+        |                              might change between minor releases.
+        |
         | Cluster deploy mode only:
         |  --driver-cores NUM          Number of cores used by the driver, only in cluster mode
         |                              (Default: 1).
         |
-        | Spark standalone or Mesos with cluster deploy mode only:
+        | Spark standalone with cluster deploy mode only:
         |  --supervise                 If given, restarts the driver on failure.
         |
-        | Spark standalone, Mesos or K8s with cluster deploy mode only:
+        | Spark standalone or K8s with cluster deploy mode only:
         |  --kill SUBMISSION_ID        If given, kills the driver specified.
         |  --status SUBMISSION_ID      If given, requests the status of the driver specified.
         |
-        | Spark standalone, Mesos and Kubernetes only:
+        | Spark standalone only:
         |  --total-executor-cores NUM  Total cores for all executors.
         |
         | Spark standalone, YARN and Kubernetes only:
@@ -579,50 +598,26 @@ private[deploy] class SparkSubmitArguments(args: Seq[String], env: Map[String, S
   /**
    * Run the Spark SQL CLI main class with the "--help" option and catch its output. Then filter
    * the results to remove unwanted lines.
-   *
-   * Since the CLI will call `System.exit()`, we install a security manager to prevent that call
-   * from working, and restore the original one afterwards.
    */
   private def getSqlShellOptions(): String = {
     val currentOut = System.out
     val currentErr = System.err
-    val currentSm = System.getSecurityManager()
     try {
       val out = new ByteArrayOutputStream()
       val stream = new PrintStream(out)
       System.setOut(stream)
       System.setErr(stream)
 
-      val sm = new SecurityManager() {
-        override def checkExit(status: Int): Unit = {
-          throw new SecurityException()
-        }
-
-        override def checkPermission(perm: java.security.Permission): Unit = {}
-      }
-      System.setSecurityManager(sm)
-
-      try {
-        Utils.classForName(mainClass).getMethod("main", classOf[Array[String]])
-          .invoke(null, Array(HELP))
-      } catch {
-        case e: InvocationTargetException =>
-          // Ignore SecurityException, since we throw it above.
-          if (!e.getCause().isInstanceOf[SecurityException]) {
-            throw e
-          }
-      }
-
+      Utils.classForName(mainClass).getMethod("printUsage").invoke(null)
       stream.flush()
 
       // Get the output and discard any unnecessary lines from it.
-      Source.fromString(new String(out.toByteArray(), StandardCharsets.UTF_8)).getLines
+      Source.fromString(new String(out.toByteArray(), StandardCharsets.UTF_8)).getLines()
         .filter { line =>
           !line.startsWith("log4j") && !line.startsWith("usage")
         }
         .mkString("\n")
     } finally {
-      System.setSecurityManager(currentSm)
       System.setOut(currentOut)
       System.setErr(currentErr)
     }

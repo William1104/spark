@@ -22,9 +22,11 @@ import java.io.Writer
 import com.univocity.parsers.csv.CsvWriter
 
 import org.apache.spark.sql.catalyst.InternalRow
-import org.apache.spark.sql.catalyst.util.{DateFormatter, TimestampFormatter}
+import org.apache.spark.sql.catalyst.util.{DateFormatter, DateTimeUtils, IntervalStringStyles, IntervalUtils, TimestampFormatter}
 import org.apache.spark.sql.catalyst.util.LegacyDateFormats.FAST_DATE_FORMAT
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
+import org.apache.spark.util.ArrayImplicits._
 
 class UnivocityGenerator(
     schema: StructType,
@@ -43,24 +45,46 @@ class UnivocityGenerator(
     schema.map(_.dataType).map(makeConverter).toArray
 
   private val timestampFormatter = TimestampFormatter(
-    options.timestampFormat,
+    options.timestampFormatInWrite,
     options.zoneId,
     options.locale,
     legacyFormat = FAST_DATE_FORMAT,
     isParsing = false)
+  private val timestampNTZFormatter = TimestampFormatter(
+    options.timestampNTZFormatInWrite,
+    options.zoneId,
+    legacyFormat = FAST_DATE_FORMAT,
+    isParsing = false,
+    forTimestampNTZ = true)
   private val dateFormatter = DateFormatter(
-    options.dateFormat,
-    options.zoneId,
+    options.dateFormatInWrite,
     options.locale,
     legacyFormat = FAST_DATE_FORMAT,
     isParsing = false)
+  private val nullAsQuotedEmptyString =
+    SQLConf.get.getConf(SQLConf.LEGACY_NULL_VALUE_WRITTEN_AS_QUOTED_EMPTY_STRING_CSV)
 
+  @scala.annotation.tailrec
   private def makeConverter(dataType: DataType): ValueConverter = dataType match {
     case DateType =>
       (row: InternalRow, ordinal: Int) => dateFormatter.format(row.getInt(ordinal))
 
     case TimestampType =>
       (row: InternalRow, ordinal: Int) => timestampFormatter.format(row.getLong(ordinal))
+
+    case TimestampNTZType =>
+      (row: InternalRow, ordinal: Int) =>
+        timestampNTZFormatter.format(DateTimeUtils.microsToLocalDateTime(row.getLong(ordinal)))
+
+    case YearMonthIntervalType(start, end) =>
+      (row: InternalRow, ordinal: Int) =>
+        IntervalUtils.toYearMonthIntervalString(
+          row.getInt(ordinal), IntervalStringStyles.ANSI_STYLE, start, end)
+
+    case DayTimeIntervalType(start, end) =>
+      (row: InternalRow, ordinal: Int) =>
+      IntervalUtils.toDayTimeIntervalString(
+        row.getLong(ordinal), IntervalStringStyles.ANSI_STYLE, start, end)
 
     case udt: UserDefinedType[_] => makeConverter(udt.sqlType)
 
@@ -75,12 +99,12 @@ class UnivocityGenerator(
     while (i < row.numFields) {
       if (!row.isNullAt(i)) {
         values(i) = valueConverters(i).apply(row, i)
-      } else {
+      } else if (nullAsQuotedEmptyString) {
         values(i) = options.nullValue
       }
       i += 1
     }
-    values
+    values.toImmutableArraySeq
   }
 
   def writeHeaders(): Unit = {

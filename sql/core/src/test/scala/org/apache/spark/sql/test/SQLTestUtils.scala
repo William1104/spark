@@ -23,6 +23,7 @@ import java.nio.file.Files
 import java.util.{Locale, UUID}
 
 import scala.concurrent.duration._
+import scala.jdk.CollectionConverters._
 import scala.language.implicitConversions
 import scala.util.control.NonFatal
 
@@ -44,6 +45,7 @@ import org.apache.spark.sql.execution.FilterExec
 import org.apache.spark.sql.execution.adaptive.DisableAdaptiveExecution
 import org.apache.spark.sql.execution.datasources.DataSourceUtils
 import org.apache.spark.sql.internal.SQLConf
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.UninterruptibleThread
 import org.apache.spark.util.Utils
 
@@ -202,7 +204,7 @@ private[sql] trait SQLTestUtils extends SparkFunSuite with SQLTestUtilsBase with
    */
   protected def withTempPaths(numPaths: Int)(f: Seq[File] => Unit): Unit = {
     val files = Array.fill[File](numPaths)(Utils.createTempDir().getCanonicalFile)
-    try f(files) finally {
+    try f(files.toImmutableArraySeq) finally {
       // wait for all tasks to finish before deleting files
       waitForTasksToFinish()
       files.foreach(Utils.deleteRecursively)
@@ -228,7 +230,7 @@ private[sql] trait SQLTestUtilsBase
   protected def sparkContext = spark.sparkContext
 
   // Shorthand for running a query using our SQLContext
-  protected lazy val sql = spark.sql _
+  protected lazy val sql: String => DataFrame = spark.sql _
 
   /**
    * A helper object for importing SQL implicits.
@@ -241,7 +243,7 @@ private[sql] trait SQLTestUtilsBase
     protected override def _sqlContext: SQLContext = self.spark.sqlContext
   }
 
-  protected override def withSQLConf(pairs: (String, String)*)(f: => Unit): Unit = {
+  protected override def withSQLConf[T](pairs: (String, String)*)(f: => T): T = {
     SparkSession.setActiveSession(spark)
     super.withSQLConf(pairs: _*)(f)
   }
@@ -392,6 +394,17 @@ private[sql] trait SQLTestUtilsBase
   }
 
   /**
+   * Restores the current catalog/database after calling `f`.
+   */
+  protected def withCurrentCatalogAndNamespace(f: => Unit): Unit = {
+    val curCatalog = sql("select current_catalog()").head().getString(0)
+    val curDatabase = sql("select current_database()").head().getString(0)
+    Utils.tryWithSafeFinally(f) {
+      spark.sql(s"USE $curCatalog.$curDatabase")
+    }
+  }
+
+  /**
    * Enables Locale `language` before executing `f`, then switches back to the default locale of JVM
    * after `f` returns.
    */
@@ -459,7 +472,9 @@ private[sql] trait SQLTestUtilsBase
    */
   def getLocalDirSize(file: File): Long = {
     assert(file.isDirectory)
-    file.listFiles.filter(f => DataSourceUtils.isDataFile(f.getName)).map(_.length).sum
+    Files.walk(file.toPath).iterator().asScala
+      .filter(p => Files.isRegularFile(p) && DataSourceUtils.isDataFile(p.getFileName.toString))
+      .map(_.toFile.length).sum
   }
 }
 

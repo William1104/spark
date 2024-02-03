@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql
 
+import org.apache.spark.{SparkException, SparkRuntimeException}
 import org.apache.spark.sql.execution.command.CharVarcharDDLTestBase
 import org.apache.spark.sql.hive.test.TestHiveSingleton
 
@@ -50,12 +51,67 @@ class HiveCharVarcharTestSuite extends CharVarcharTestSuite with TestHiveSinglet
       assert(rest.contains("CHAR(5)"))
     }
   }
+
+  test("SPARK-35700: Read char/varchar orc table with created and written by external systems") {
+    withTable("t") {
+      hiveClient.runSqlHive("CREATE TABLE t(c CHAR(5), v VARCHAR(7)) STORED AS ORC")
+      hiveClient.runSqlHive("INSERT INTO t VALUES('Spark', 'kyuubi')")
+      checkAnswer(sql("SELECT c, v from t"), Row("Spark", "kyuubi"))
+      checkAnswer(sql("SELECT v from t where c = 'Spark' and v = 'kyuubi'"), Row("kyuubi"))
+    }
+  }
+
+  test("SPARK-36552: Fix different behavior of writing char/varchar to hive and datasource table") {
+    Seq("true", "false").foreach { v =>
+      withSQLConf(
+        "spark.sql.hive.convertMetastoreParquet" -> v,
+        "spark.sql.legacy.charVarcharAsString" -> "true") {
+        withTable("t") {
+          sql(s"CREATE TABLE t (c varchar(2)) USING $format")
+          sql("INSERT INTO t SELECT 'kyuubi'")
+          checkAnswer(sql("SELECT c from t"), Row("kyuubi"))
+        }
+      }
+    }
+  }
+
+  test("char/varchar type values length check: partitioned columns of other types") {
+    val tableName = "t"
+    Seq("CHAR(5)", "VARCHAR(5)").foreach { typ =>
+      withTable(tableName) {
+        sql(s"CREATE TABLE $tableName(i STRING, c $typ) USING $format PARTITIONED BY (c)")
+        Seq(1, 10, 100, 1000, 10000).foreach { v =>
+          sql(s"INSERT OVERWRITE $tableName VALUES ('1', $v)")
+          checkPlainResult(spark.table(tableName), typ, v.toString)
+          sql(s"ALTER TABLE $tableName DROP PARTITION(c=$v)")
+          checkAnswer(spark.table(tableName), Nil)
+        }
+
+        val e1 = intercept[SparkException](sql(s"INSERT OVERWRITE $tableName VALUES ('1', 100000)"))
+        checkError(
+          exception = e1.getCause.asInstanceOf[SparkException],
+          errorClass = "TASK_WRITE_FAILED",
+          parameters = Map("path" -> s".*$tableName.*"),
+          matchPVals = true
+        )
+
+        val e2 = intercept[SparkRuntimeException](sql("ALTER TABLE t DROP PARTITION(c=100000)"))
+        checkError(
+          exception = e2,
+          errorClass = "EXCEED_LIMIT_LENGTH",
+          parameters = Map("limit" -> "5")
+        )
+      }
+    }
+  }
 }
 
 class HiveCharVarcharDDLTestSuite extends CharVarcharDDLTestBase with TestHiveSingleton {
 
   // The default Hive serde doesn't support nested null values.
   override def format: String = "hive OPTIONS(fileFormat='parquet')"
+
+  override def getTableName(name: String): String = s"`spark_catalog`.`default`.`$name`"
 
   private var originalPartitionMode = ""
 

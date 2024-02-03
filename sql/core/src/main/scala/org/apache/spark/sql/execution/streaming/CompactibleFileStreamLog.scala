@@ -24,10 +24,11 @@ import scala.io.{Source => IOSource}
 import scala.reflect.ClassTag
 
 import org.apache.hadoop.fs.Path
-import org.json4s.NoTypeHints
+import org.json4s.{Formats, NoTypeHints}
 import org.json4s.jackson.Serialization
 
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.util.Utils
 
 /**
@@ -48,9 +49,10 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
 
   import CompactibleFileStreamLog._
 
-  private implicit val formats = Serialization.formats(NoTypeHints)
+  private implicit val formats: Formats = Serialization.formats(NoTypeHints)
 
   /** Needed to serialize type T into JSON when using Jackson */
+  @scala.annotation.nowarn
   private implicit val manifest = Manifest.classType[T](implicitly[ClassTag[T]].runtimeClass)
 
   protected val minBatchesToRetain = sparkSession.sessionState.conf.minBatchesToRetain
@@ -176,11 +178,11 @@ abstract class CompactibleFileStreamLog[T <: AnyRef : ClassTag](
    * CompactibleFileStreamLog maintains logs by itself, and manual purging might break internal
    * state, specifically which latest compaction batch is purged.
    *
-   * To simplify the situation, this method just throws UnsupportedOperationException regardless
-   * of given parameter, and let CompactibleFileStreamLog handles purging by itself.
+   * To simplify the situation, this method just throws SparkUnsupportedOperationException
+   * regardless of given parameter, and let CompactibleFileStreamLog handles purging by itself.
    */
-  override def purge(thresholdBatchId: Long): Unit = throw new UnsupportedOperationException(
-    s"Cannot purge as it might break internal state.")
+  override def purge(thresholdBatchId: Long): Unit =
+    throw QueryExecutionErrors.cannotPurgeAsBreakInternalStateError()
 
   /**
    * Apply function on all entries in the specific batch. The method will throw
@@ -386,7 +388,7 @@ object CompactibleFileStreamLog {
     } else if (defaultInterval < (latestCompactBatchId + 1) / 2) {
       // Find the first divisor >= default compact interval
       def properDivisors(min: Int, n: Int) =
-        (min to n/2).view.filter(i => n % i == 0).toSeq :+ n
+        (min to n / 2).to(LazyList).filter(i => n % i == 0) :+ n
 
       properDivisors(defaultInterval, latestCompactBatchId + 1).head
     } else {

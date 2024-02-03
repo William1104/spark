@@ -19,8 +19,9 @@ package org.apache.spark.scheduler.cluster.k8s
 import java.util.Arrays
 import java.util.concurrent.TimeUnit
 
-import io.fabric8.kubernetes.api.model.{Pod, PodList}
+import io.fabric8.kubernetes.api.model.{ConfigMap, Pod, PodList}
 import io.fabric8.kubernetes.client.KubernetesClient
+import io.fabric8.kubernetes.client.dsl.PodResource
 import org.jmock.lib.concurrent.DeterministicScheduler
 import org.mockito.{ArgumentCaptor, Mock, MockitoAnnotations}
 import org.mockito.ArgumentMatchers.{any, eq => mockitoEq}
@@ -32,7 +33,7 @@ import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants._
 import org.apache.spark.deploy.k8s.Fabric8Aliases._
 import org.apache.spark.resource.{ResourceProfile, ResourceProfileManager}
-import org.apache.spark.rpc.{RpcEndpoint, RpcEndpointRef, RpcEnv}
+import org.apache.spark.rpc.{RpcCallContext, RpcEndpoint, RpcEndpointRef, RpcEnv}
 import org.apache.spark.scheduler.{ExecutorKilled, LiveListenerBus, TaskSchedulerImpl}
 import org.apache.spark.scheduler.cluster.CoarseGrainedClusterMessages.{RegisterExecutor, RemoveExecutor, StopDriver}
 import org.apache.spark.scheduler.cluster.CoarseGrainedSchedulerBackend
@@ -44,6 +45,8 @@ class KubernetesClusterSchedulerBackendSuite extends SparkFunSuite with BeforeAn
   private val sparkConf = new SparkConf(false)
     .set("spark.executor.instances", "3")
     .set("spark.app.id", TEST_SPARK_APP_ID)
+    .set(KUBERNETES_EXECUTOR_DECOMMISSION_LABEL.key, "soLong")
+    .set(KUBERNETES_EXECUTOR_DECOMMISSION_LABEL_VALUE.key, "cruelWorld")
 
   @Mock
   private var sc: SparkContext = _
@@ -64,13 +67,22 @@ class KubernetesClusterSchedulerBackendSuite extends SparkFunSuite with BeforeAn
   private var podOperations: PODS = _
 
   @Mock
+  private var podsWithNamespace: PODS_WITH_NAMESPACE = _
+
+  @Mock
   private var labeledPods: LABELED_PODS = _
 
   @Mock
   private var configMapsOperations: CONFIG_MAPS = _
 
   @Mock
-  private var labledConfigMaps: LABELED_CONFIG_MAPS = _
+  private var configMapsWithNamespace: CONFIG_MAPS_WITH_NAMESPACE = _
+
+  @Mock
+  private var configMapResource: CONFIG_MAPS_RESOURCE = _
+
+  @Mock
+  private var labeledConfigMaps: LABELED_CONFIG_MAPS = _
 
   @Mock
   private var taskScheduler: TaskSchedulerImpl = _
@@ -89,6 +101,9 @@ class KubernetesClusterSchedulerBackendSuite extends SparkFunSuite with BeforeAn
 
   @Mock
   private var pollEvents: ExecutorPodsPollingSnapshotSource = _
+
+  @Mock
+  private var context: RpcCallContext = _
 
   private var driverEndpoint: ArgumentCaptor[RpcEndpoint] = _
   private var schedulerBackendUnderTest: KubernetesClusterSchedulerBackend = _
@@ -111,7 +126,10 @@ class KubernetesClusterSchedulerBackendSuite extends SparkFunSuite with BeforeAn
         driverEndpoint.capture()))
       .thenReturn(driverEndpointRef)
     when(kubernetesClient.pods()).thenReturn(podOperations)
+    when(podOperations.inNamespace("default")).thenReturn(podsWithNamespace)
     when(kubernetesClient.configMaps()).thenReturn(configMapsOperations)
+    when(configMapsOperations.inNamespace("default")).thenReturn(configMapsWithNamespace)
+    when(configMapsWithNamespace.resource(any[ConfigMap]())).thenReturn(configMapResource)
     when(podAllocator.driverPod).thenReturn(None)
     schedulerBackendUnderTest = new KubernetesClusterSchedulerBackend(
       taskScheduler,
@@ -125,6 +143,10 @@ class KubernetesClusterSchedulerBackendSuite extends SparkFunSuite with BeforeAn
       pollEvents)
   }
 
+  after {
+    ResourceProfile.clearDefaultProfile()
+  }
+
   test("Start all components") {
     schedulerBackendUnderTest.start()
     verify(podAllocator).setTotalExpectedExecutors(Map(defaultProfile -> 3))
@@ -132,59 +154,83 @@ class KubernetesClusterSchedulerBackendSuite extends SparkFunSuite with BeforeAn
     verify(lifecycleEventHandler).start(schedulerBackendUnderTest)
     verify(watchEvents).start(TEST_SPARK_APP_ID)
     verify(pollEvents).start(TEST_SPARK_APP_ID)
-    verify(configMapsOperations).create(any())
+    verify(configMapResource).create()
   }
 
   test("Stop all components") {
-    when(podOperations.withLabel(SPARK_APP_ID_LABEL, TEST_SPARK_APP_ID)).thenReturn(labeledPods)
+    when(podsWithNamespace.withLabel(SPARK_APP_ID_LABEL, TEST_SPARK_APP_ID)).thenReturn(labeledPods)
     when(labeledPods.withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)).thenReturn(labeledPods)
-    when(configMapsOperations.withLabel(SPARK_APP_ID_LABEL, TEST_SPARK_APP_ID))
-      .thenReturn(labledConfigMaps)
-    when(labledConfigMaps.withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE))
-      .thenReturn(labledConfigMaps)
+    when(configMapsWithNamespace.withLabel(SPARK_APP_ID_LABEL, TEST_SPARK_APP_ID))
+      .thenReturn(labeledConfigMaps)
+    when(labeledConfigMaps.withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE))
+      .thenReturn(labeledConfigMaps)
     schedulerBackendUnderTest.stop()
     verify(eventQueue).stop()
     verify(watchEvents).stop()
     verify(pollEvents).stop()
-    verify(labeledPods).delete()
-    verify(labledConfigMaps).delete()
+    verify(podAllocator).stop(TEST_SPARK_APP_ID)
+    verify(labeledConfigMaps).delete()
     verify(kubernetesClient).close()
   }
 
   test("Remove executor") {
-    val backend = spy(schedulerBackendUnderTest)
+    val backend = spy[KubernetesClusterSchedulerBackend](schedulerBackendUnderTest)
     when(backend.isExecutorActive(any())).thenReturn(false)
     when(backend.isExecutorActive(mockitoEq("2"))).thenReturn(true)
 
     backend.start()
     backend.doRemoveExecutor("1", ExecutorKilled)
-    verify(driverEndpointRef, never()).send(RemoveExecutor("1", ExecutorKilled))
+    verify(driverEndpointRef).send(RemoveExecutor("1", ExecutorKilled))
 
     backend.doRemoveExecutor("2", ExecutorKilled)
-    verify(driverEndpointRef, never()).send(RemoveExecutor("1", ExecutorKilled))
+    verify(driverEndpointRef).send(RemoveExecutor("2", ExecutorKilled))
   }
 
   test("Kill executors") {
     schedulerBackendUnderTest.start()
-    when(podOperations.withField(any(), any())).thenReturn(labeledPods)
+
+    when(podsWithNamespace.withField(any(), any())).thenReturn(labeledPods)
+    when(podsWithNamespace.withLabel(SPARK_APP_ID_LABEL, TEST_SPARK_APP_ID)).thenReturn(labeledPods)
     when(labeledPods.withLabel(SPARK_APP_ID_LABEL, TEST_SPARK_APP_ID)).thenReturn(labeledPods)
     when(labeledPods.withLabel(SPARK_ROLE_LABEL, SPARK_POD_EXECUTOR_ROLE)).thenReturn(labeledPods)
     when(labeledPods.withLabelIn(SPARK_EXECUTOR_ID_LABEL, "1", "2")).thenReturn(labeledPods)
-
-    val podList = mock(classOf[PodList])
-    when(labeledPods.list()).thenReturn(podList)
-    when(podList.getItems()).thenReturn(Arrays.asList[Pod]())
+    val pod1op = mock(classOf[PodResource])
+    val pod2op = mock(classOf[PodResource])
+    when(labeledPods.resources()).thenReturn(Arrays.asList[PodResource]().stream)
+    schedulerExecutorService.tick(sparkConf.get(KUBERNETES_DYN_ALLOC_KILL_GRACE_PERIOD) * 2,
+      TimeUnit.MILLISECONDS)
+    verify(labeledPods, never()).delete()
 
     schedulerBackendUnderTest.doKillExecutors(Seq("1", "2"))
     verify(driverEndpointRef).send(RemoveExecutor("1", ExecutorKilled))
     verify(driverEndpointRef).send(RemoveExecutor("2", ExecutorKilled))
     verify(labeledPods, never()).delete()
+    verify(pod1op, never()).edit(any(
+      classOf[java.util.function.UnaryOperator[io.fabric8.kubernetes.api.model.Pod]]))
+    verify(pod2op, never()).edit(any(
+      classOf[java.util.function.UnaryOperator[io.fabric8.kubernetes.api.model.Pod]]))
     schedulerExecutorService.tick(sparkConf.get(KUBERNETES_DYN_ALLOC_KILL_GRACE_PERIOD) * 2,
       TimeUnit.MILLISECONDS)
     verify(labeledPods, never()).delete()
+    verify(pod1op, never()).edit(any(
+      classOf[java.util.function.UnaryOperator[io.fabric8.kubernetes.api.model.Pod]]))
+    verify(pod2op, never()).edit(any(
+      classOf[java.util.function.UnaryOperator[io.fabric8.kubernetes.api.model.Pod]]))
 
-    when(podList.getItems()).thenReturn(Arrays.asList(mock(classOf[Pod])))
+    when(labeledPods.resources()).thenReturn(Arrays.asList(pod1op).stream)
+    val podList = mock(classOf[PodList])
+    when(labeledPods.list()).thenReturn(podList)
+    val pod1 = mock(classOf[Pod])
+    val pod2 = mock(classOf[Pod])
+    when(podList.getItems).thenReturn(Arrays.asList(pod1, pod2))
+
     schedulerBackendUnderTest.doKillExecutors(Seq("1", "2"))
+    verify(labeledPods, never()).delete()
+    schedulerExecutorService.runUntilIdle()
+    verify(pod1op).edit(any(
+      classOf[java.util.function.UnaryOperator[io.fabric8.kubernetes.api.model.Pod]]))
+    verify(pod2op, never()).edit(any(
+      classOf[java.util.function.UnaryOperator[io.fabric8.kubernetes.api.model.Pod]]))
     verify(labeledPods, never()).delete()
     schedulerExecutorService.tick(sparkConf.get(KUBERNETES_DYN_ALLOC_KILL_GRACE_PERIOD) * 2,
       TimeUnit.MILLISECONDS)
@@ -206,5 +252,11 @@ class KubernetesClusterSchedulerBackendSuite extends SparkFunSuite with BeforeAn
     val endpoint = schedulerBackendUnderTest.createDriverEndpoint()
     endpoint.receiveAndReply(null).apply(
       RegisterExecutor("1", null, "host1", 1, Map.empty, Map.empty, Map.empty, 0))
+  }
+
+  test("Dynamically fetch an executor ID") {
+    val endpoint = schedulerBackendUnderTest.createDriverEndpoint()
+    endpoint.receiveAndReply(context).apply(GenerateExecID("cheeseBurger"))
+    verify(context).reply("1")
   }
 }

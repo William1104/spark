@@ -24,9 +24,11 @@ import org.apache.hadoop.fs.{FileSystem, Path}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.ConfigEntry
 import org.apache.spark.sql.{Dataset, SparkSession}
+import org.apache.spark.sql.catalyst.catalog.HiveTableRelation
 import org.apache.spark.sql.catalyst.expressions.{Attribute, SubqueryExpression}
 import org.apache.spark.sql.catalyst.optimizer.EliminateResolvedHint
-import org.apache.spark.sql.catalyst.plans.logical.{IgnoreCachedData, LogicalPlan, ResolvedHint}
+import org.apache.spark.sql.catalyst.plans.logical.{IgnoreCachedData, LogicalPlan, ResolvedHint, SubqueryAlias, View}
+import org.apache.spark.sql.catalyst.trees.TreePattern.PLAN_EXPRESSION
 import org.apache.spark.sql.execution.adaptive.AdaptiveSparkPlanHelper
 import org.apache.spark.sql.execution.columnar.InMemoryRelation
 import org.apache.spark.sql.execution.command.CommandUtils
@@ -35,6 +37,7 @@ import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Relation, File
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.storage.StorageLevel
 import org.apache.spark.storage.StorageLevel.MEMORY_AND_DISK
+import org.apache.spark.util.ArrayImplicits._
 
 /** Holds a cached logical plan and its data */
 case class CachedData(plan: LogicalPlan, cachedRepresentation: InMemoryRelation)
@@ -88,7 +91,7 @@ class CacheManager extends Logging with AdaptiveSparkPlanHelper {
       query: Dataset[_],
       tableName: Option[String] = None,
       storageLevel: StorageLevel = MEMORY_AND_DISK): Unit = {
-    cacheQuery(query.sparkSession, query.logicalPlan, tableName, storageLevel)
+    cacheQuery(query.sparkSession, query.queryExecution.normalized, tableName, storageLevel)
   }
 
   /**
@@ -111,11 +114,12 @@ class CacheManager extends Logging with AdaptiveSparkPlanHelper {
       planToCache: LogicalPlan,
       tableName: Option[String],
       storageLevel: StorageLevel): Unit = {
-    if (lookupCachedData(planToCache).nonEmpty) {
+    if (storageLevel == StorageLevel.NONE) {
+      // Do nothing for StorageLevel.NONE since it will not actually cache any data.
+    } else if (lookupCachedData(planToCache).nonEmpty) {
       logWarning("Asked to cache already cached data.")
     } else {
-      val sessionWithConfigsOff = SparkSession.getOrCloneSessionWithConfigsOff(
-        spark, forceDisableConfigs)
+      val sessionWithConfigsOff = getOrCloneSessionWithConfigsOff(spark)
       val inMemoryRelation = sessionWithConfigsOff.withActive {
         val qe = sessionWithConfigsOff.sessionState.executePlan(planToCache)
         InMemoryRelation(
@@ -143,7 +147,7 @@ class CacheManager extends Logging with AdaptiveSparkPlanHelper {
   def uncacheQuery(
       query: Dataset[_],
       cascade: Boolean): Unit = {
-    uncacheQuery(query.sparkSession, query.logicalPlan, cascade)
+    uncacheQuery(query.sparkSession, query.queryExecution.normalized, cascade)
   }
 
   /**
@@ -159,11 +163,56 @@ class CacheManager extends Logging with AdaptiveSparkPlanHelper {
       plan: LogicalPlan,
       cascade: Boolean,
       blocking: Boolean = false): Unit = {
+    uncacheQuery(spark, _.sameResult(plan), cascade, blocking)
+  }
+
+  def uncacheTableOrView(spark: SparkSession, name: Seq[String], cascade: Boolean): Unit = {
+    uncacheQuery(
+      spark,
+      isMatchedTableOrView(_, name, spark.sessionState.conf),
+      cascade,
+      blocking = false)
+  }
+
+  private def isMatchedTableOrView(plan: LogicalPlan, name: Seq[String], conf: SQLConf): Boolean = {
+    def isSameName(nameInCache: Seq[String]): Boolean = {
+      nameInCache.length == name.length && nameInCache.zip(name).forall(conf.resolver.tupled)
+    }
+
+    plan match {
+      case SubqueryAlias(ident, LogicalRelation(_, _, Some(catalogTable), _)) =>
+        val v1Ident = catalogTable.identifier
+        isSameName(ident.qualifier :+ ident.name) &&
+          isSameName(v1Ident.catalog.toSeq ++ v1Ident.database :+ v1Ident.table)
+
+      case SubqueryAlias(ident, DataSourceV2Relation(_, _, Some(catalog), Some(v2Ident), _)) =>
+        isSameName(ident.qualifier :+ ident.name) &&
+          isSameName((catalog.name() +: v2Ident.namespace() :+ v2Ident.name()).toImmutableArraySeq)
+
+      case SubqueryAlias(ident, View(catalogTable, _, _)) =>
+        val v1Ident = catalogTable.identifier
+        isSameName(ident.qualifier :+ ident.name) &&
+          isSameName(v1Ident.catalog.toSeq ++ v1Ident.database :+ v1Ident.table)
+
+      case SubqueryAlias(ident, HiveTableRelation(catalogTable, _, _, _, _)) =>
+        val v1Ident = catalogTable.identifier
+        isSameName(ident.qualifier :+ ident.name) &&
+          isSameName(v1Ident.catalog.toSeq ++ v1Ident.database :+ v1Ident.table)
+
+      case _ => false
+    }
+  }
+
+  def uncacheQuery(
+      spark: SparkSession,
+      isMatchedPlan: LogicalPlan => Boolean,
+      cascade: Boolean,
+      blocking: Boolean): Unit = {
     val shouldRemove: LogicalPlan => Boolean =
       if (cascade) {
-        _.find(_.sameResult(plan)).isDefined
+        _.exists(isMatchedPlan)
       } else {
-        _.sameResult(plan)
+        isMatchedPlan
       }
     val plansToUncache = cachedData.filter(cd => shouldRemove(cd.plan))
     this.synchronized {
@@ -187,7 +236,7 @@ class CacheManager extends Logging with AdaptiveSparkPlanHelper {
         //    will keep it as it is. It means the physical plan has been re-compiled already in the
         //    other thread.
         val cacheAlreadyLoaded = cd.cachedRepresentation.cacheBuilder.isCachedColumnBuffersLoaded
-        cd.plan.find(_.sameResult(plan)).isDefined && !cacheAlreadyLoaded
+        cd.plan.exists(isMatchedPlan) && !cacheAlreadyLoaded
       })
     }
   }
@@ -207,7 +256,7 @@ class CacheManager extends Logging with AdaptiveSparkPlanHelper {
    * Tries to re-cache all the cache entries that refer to the given plan.
    */
   def recacheByPlan(spark: SparkSession, plan: LogicalPlan): Unit = {
-    recacheByCondition(spark, _.plan.find(_.sameResult(plan)).isDefined)
+    recacheByCondition(spark, _.plan.exists(_.sameResult(plan)))
   }
 
   /**
@@ -223,8 +272,7 @@ class CacheManager extends Logging with AdaptiveSparkPlanHelper {
     }
     needToRecache.foreach { cd =>
       cd.cachedRepresentation.cacheBuilder.clearCache()
-      val sessionWithConfigsOff = SparkSession.getOrCloneSessionWithConfigsOff(
-        spark, forceDisableConfigs)
+      val sessionWithConfigsOff = getOrCloneSessionWithConfigsOff(spark)
       val newCache = sessionWithConfigsOff.withActive {
         val qe = sessionWithConfigsOff.sessionState.executePlan(cd.plan)
         InMemoryRelation(cd.cachedRepresentation.cacheBuilder, qe)
@@ -242,7 +290,7 @@ class CacheManager extends Logging with AdaptiveSparkPlanHelper {
 
   /** Optionally returns cached data for the given [[Dataset]] */
   def lookupCachedData(query: Dataset[_]): Option[CachedData] = {
-    lookupCachedData(query.logicalPlan)
+    lookupCachedData(query.queryExecution.normalized)
   }
 
   /** Optionally returns cached data for the given [[LogicalPlan]]. */
@@ -268,7 +316,7 @@ class CacheManager extends Logging with AdaptiveSparkPlanHelper {
         }.getOrElse(currentFragment)
     }
 
-    newPlan transformAllExpressions {
+    newPlan.transformAllExpressionsWithPruning(_.containsPattern(PLAN_EXPRESSION)) {
       case s: SubqueryExpression => s.withNewPlan(useCachedData(s.plan))
     }
   }
@@ -289,7 +337,7 @@ class CacheManager extends Logging with AdaptiveSparkPlanHelper {
    */
   def recacheByPath(spark: SparkSession, resourcePath: Path, fs: FileSystem): Unit = {
     val qualifiedPath = fs.makeQualified(resourcePath)
-    recacheByCondition(spark, _.plan.find(lookupAndRefresh(_, fs, qualifiedPath)).isDefined)
+    recacheByCondition(spark, _.plan.exists(lookupAndRefresh(_, fs, qualifiedPath)))
   }
 
   /**
@@ -314,18 +362,52 @@ class CacheManager extends Logging with AdaptiveSparkPlanHelper {
   }
 
   /**
-   * Refresh the given [[FileIndex]] if any of its root paths starts with `qualifiedPath`.
+   * Refresh the given [[FileIndex]] if any of its root paths is a subdirectory
+   * of the `qualifiedPath`.
    * @return whether the [[FileIndex]] is refreshed.
    */
   private def refreshFileIndexIfNecessary(
       fileIndex: FileIndex,
       fs: FileSystem,
       qualifiedPath: Path): Boolean = {
-    val prefixToInvalidate = qualifiedPath.toString
     val needToRefresh = fileIndex.rootPaths
-      .map(_.makeQualified(fs.getUri, fs.getWorkingDirectory).toString)
-      .exists(_.startsWith(prefixToInvalidate))
+      .map(_.makeQualified(fs.getUri, fs.getWorkingDirectory))
+      .exists(isSubDir(qualifiedPath, _))
     if (needToRefresh) fileIndex.refresh()
     needToRefresh
+  }
+
+  /**
+   * Checks if the given child path is a sub-directory of the given parent path.
+   * @param qualifiedPathChild:
+   *   Fully qualified child path
+   * @param qualifiedPathParent:
+   *   Fully qualified parent path.
+   * @return
+   *   True if the child path is a sub-directory of the given parent path. Otherwise, false.
+   */
+  def isSubDir(qualifiedPathParent: Path, qualifiedPathChild: Path): Boolean = {
+    Iterator
+      .iterate(qualifiedPathChild)(_.getParent)
+      .takeWhile(_ != null)
+      .exists(_.equals(qualifiedPathParent))
+  }
+
+  /**
+   * If `CAN_CHANGE_CACHED_PLAN_OUTPUT_PARTITIONING` is enabled, return the session with disabled
+   * `AUTO_BUCKETED_SCAN_ENABLED`.
+   * If `CAN_CHANGE_CACHED_PLAN_OUTPUT_PARTITIONING` is disabled, return the session with disabled
+   * `AUTO_BUCKETED_SCAN_ENABLED` and `ADAPTIVE_EXECUTION_ENABLED`.
+   */
+  private def getOrCloneSessionWithConfigsOff(session: SparkSession): SparkSession = {
+    if (session.conf.get(SQLConf.CAN_CHANGE_CACHED_PLAN_OUTPUT_PARTITIONING)) {
+      // Bucketed scan only has one time overhead but can have multi-times benefits in cache,
+      // so we always do bucketed scan in a cached plan.
+      SparkSession.getOrCloneSessionWithConfigsOff(session,
+        SQLConf.ADAPTIVE_EXECUTION_APPLY_FINAL_STAGE_SHUFFLE_OPTIMIZATIONS ::
+          SQLConf.AUTO_BUCKETED_SCAN_ENABLED :: Nil)
+    } else {
+      SparkSession.getOrCloneSessionWithConfigsOff(session, forceDisableConfigs)
+    }
   }
 }

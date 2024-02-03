@@ -20,26 +20,30 @@ package org.apache.spark.sql.streaming
 import java.util.Locale
 import java.util.concurrent.TimeoutException
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.hadoop.fs.Path
 
 import org.apache.spark.annotation.Evolving
 import org.apache.spark.api.java.function.VoidFunction2
 import org.apache.spark.sql._
+import org.apache.spark.sql.catalyst.analysis.UnresolvedIdentifier
 import org.apache.spark.sql.catalyst.catalog.{CatalogTable, CatalogTableType}
-import org.apache.spark.sql.catalyst.plans.logical.CreateTableStatement
+import org.apache.spark.sql.catalyst.encoders.ExpressionEncoder
+import org.apache.spark.sql.catalyst.plans.logical.{ColumnDefinition, CreateTable, OptionList, UnresolvedTableSpec}
 import org.apache.spark.sql.catalyst.streaming.InternalOutputModes
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
 import org.apache.spark.sql.connector.catalog.{Identifier, SupportsWrite, Table, TableCatalog, TableProvider, V1Table, V2TableWithV1Fallback}
 import org.apache.spark.sql.connector.catalog.TableCapability._
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.execution.command.DDLUtils
 import org.apache.spark.sql.execution.datasources.DataSource
 import org.apache.spark.sql.execution.datasources.v2.{DataSourceV2Utils, FileDataSourceV2}
 import org.apache.spark.sql.execution.streaming._
 import org.apache.spark.sql.execution.streaming.sources._
-import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
 
 /**
@@ -167,23 +171,6 @@ final class DataStreamWriter[T] private[sql](ds: Dataset[T]) {
   /**
    * Adds an output option for the underlying data source.
    *
-   * You can set the following option(s):
-   * <ul>
-   * <li>`timeZone` (default session local timezone): sets the string that indicates a time zone ID
-   * to be used to format timestamps in the JSON/CSV datasources or partition values. The following
-   * formats of `timeZone` are supported:
-   *   <ul>
-   *     <li> Region-based zone ID: It should have the form 'area/city', such as
-   *         'America/Los_Angeles'.</li>
-   *     <li> Zone offset: It should be in the format '(+|-)HH:mm', for example '-08:00'
-   *          or '+01:00'. Also 'UTC' and 'Z' are supported as aliases of '+00:00'.</li>
-   *   </ul>
-   * Other short names like 'CST' are not recommended to use because they can be ambiguous.
-   * If it isn't set, the current value of the SQL config `spark.sql.session.timeZone` is
-   * used by default.
-   * </li>
-   * </ul>
-   *
    * @since 2.0.0
    */
   def option(key: String, value: String): DataStreamWriter[T] = {
@@ -215,23 +202,6 @@ final class DataStreamWriter[T] private[sql](ds: Dataset[T]) {
   /**
    * (Scala-specific) Adds output options for the underlying data source.
    *
-   * You can set the following option(s):
-   * <ul>
-   * <li>`timeZone` (default session local timezone): sets the string that indicates a time zone ID
-   * to be used to format timestamps in the JSON/CSV datasources or partition values. The following
-   * formats of `timeZone` are supported:
-   *   <ul>
-   *     <li> Region-based zone ID: It should have the form 'area/city', such as
-   *         'America/Los_Angeles'.</li>
-   *     <li> Zone offset: It should be in the format '(+|-)HH:mm', for example '-08:00'
-   *          or '+01:00'. Also 'UTC' and 'Z' are supported as aliases of '+00:00'.</li>
-   *   </ul>
-   * Other short names like 'CST' are not recommended to use because they can be ambiguous.
-   * If it isn't set, the current value of the SQL config `spark.sql.session.timeZone` is
-   * used by default.
-   * </li>
-   * </ul>
-   *
    * @since 2.0.0
    */
   def options(options: scala.collection.Map[String, String]): DataStreamWriter[T] = {
@@ -241,23 +211,6 @@ final class DataStreamWriter[T] private[sql](ds: Dataset[T]) {
 
   /**
    * Adds output options for the underlying data source.
-   *
-   * You can set the following option(s):
-   * <ul>
-   * <li>`timeZone` (default session local timezone): sets the string that indicates a time zone ID
-   * to be used to format timestamps in the JSON/CSV datasources or partition values. The following
-   * formats of `timeZone` are supported:
-   *   <ul>
-   *     <li> Region-based zone ID: It should have the form 'area/city', such as
-   *         'America/Los_Angeles'.</li>
-   *     <li> Zone offset: It should be in the format '(+|-)HH:mm', for example '-08:00'
-   *          or '+01:00'. Also 'UTC' and 'Z' are supported as aliases of '+00:00'.</li>
-   *   </ul>
-   * Other short names like 'CST' are not recommended to use because they can be ambiguous.
-   * If it isn't set, the current value of the SQL config `spark.sql.session.timeZone` is
-   * used by default.
-   * </li>
-   * </ul>
    *
    * @since 2.0.0
    */
@@ -276,9 +229,7 @@ final class DataStreamWriter[T] private[sql](ds: Dataset[T]) {
   def start(path: String): StreamingQuery = {
     if (!df.sparkSession.sessionState.conf.legacyPathOptionBehavior &&
         extraOptions.contains("path")) {
-      throw new AnalysisException("There is a 'path' option set and start() is called with a " +
-        "path parameter. Either remove the path option, or call start() without the parameter. " +
-        s"To ignore this check, set '${SQLConf.LEGACY_PATH_OPTION_BEHAVIOR.key}' to 'true'.")
+      throw QueryCompilationErrors.setPathOptionAndCallWithPathParameterError("start")
     }
     startInternal(Some(path))
   }
@@ -322,17 +273,16 @@ final class DataStreamWriter[T] private[sql](ds: Dataset[T]) {
     this.tableName = tableName
 
     import df.sparkSession.sessionState.analyzer.CatalogAndIdentifier
-
     import org.apache.spark.sql.connector.catalog.CatalogV2Implicits._
-    val originalMultipartIdentifier = df.sparkSession.sessionState.sqlParser
-      .parseMultipartIdentifier(tableName)
+    val parser = df.sparkSession.sessionState.sqlParser
+    val originalMultipartIdentifier = parser.parseMultipartIdentifier(tableName)
     val CatalogAndIdentifier(catalog, identifier) = originalMultipartIdentifier
 
     // Currently we don't create a logical streaming writer node in logical plan, so cannot rely
     // on analyzer to resolve it. Directly lookup only for temp view to provide clearer message.
     // TODO (SPARK-27484): we should add the writing node before the plan is analyzed.
     if (df.sparkSession.sessionState.catalog.isTempView(originalMultipartIdentifier)) {
-      throw new AnalysisException(s"Temporary view $tableName doesn't support streaming write")
+      throw QueryCompilationErrors.tempViewNotSupportStreamingWriteError(tableName)
     }
 
     if (!catalog.asTableCatalog.tableExists(identifier)) {
@@ -341,19 +291,20 @@ final class DataStreamWriter[T] private[sql](ds: Dataset[T]) {
        * Note, currently the new table creation by this API doesn't fully cover the V2 table.
        * TODO (SPARK-33638): Full support of v2 table creation
        */
-      val cmd = CreateTableStatement(
-        originalMultipartIdentifier,
-        df.schema.asNullable,
-        partitioningColumns.getOrElse(Nil).asTransforms.toSeq,
-        None,
+      val tableSpec = UnresolvedTableSpec(
         Map.empty[String, String],
         Some(source),
-        Map.empty[String, String],
+        OptionList(Seq.empty),
         extraOptions.get("path"),
         None,
         None,
-        external = false,
-        ifNotExists = false)
+        false)
+      val cmd = CreateTable(
+        UnresolvedIdentifier(originalMultipartIdentifier),
+        df.schema.asNullable.map(ColumnDefinition.fromV1Column(_, parser)),
+        partitioningColumns.getOrElse(Nil).asTransforms.toImmutableArraySeq,
+        tableSpec,
+        ignoreIfExists = false)
       Dataset.ofRows(df.sparkSession, cmd)
     }
 
@@ -361,15 +312,15 @@ final class DataStreamWriter[T] private[sql](ds: Dataset[T]) {
 
     def writeToV1Table(table: CatalogTable): StreamingQuery = {
       if (table.tableType == CatalogTableType.VIEW) {
-        throw new AnalysisException(s"Streaming into views $tableName is not supported.")
+        throw QueryCompilationErrors.streamingIntoViewNotSupportedError(tableName)
       }
       require(table.provider.isDefined)
       if (source != table.provider.get) {
-        throw new AnalysisException(s"The input source($source) is different from the table " +
-          s"$tableName's data source provider(${table.provider.get}).")
+        throw QueryCompilationErrors.inputSourceDiffersFromDataSourceProviderError(
+          source, tableName, table)
       }
-      format(table.provider.get)
-        .option("path", new Path(table.location).toString).start()
+      format(table.provider.get).startInternal(
+        Some(new Path(table.location).toString), catalogTable = Some(table))
     }
 
     import org.apache.spark.sql.execution.datasources.v2.DataSourceV2Implicits._
@@ -380,43 +331,45 @@ final class DataStreamWriter[T] private[sql](ds: Dataset[T]) {
         writeToV1Table(t.v1Table)
       case t: V1Table =>
         writeToV1Table(t.v1Table)
-      case t => throw new AnalysisException(s"Table $tableName doesn't support streaming " +
-        s"write - $t")
+      case t => throw QueryCompilationErrors.tableNotSupportStreamingWriteError(tableName, t)
     }
   }
 
-  private def startInternal(path: Option[String]): StreamingQuery = {
+  private def startInternal(
+      path: Option[String],
+      catalogTable: Option[CatalogTable] = None): StreamingQuery = {
     if (source.toLowerCase(Locale.ROOT) == DDLUtils.HIVE_PROVIDER) {
-      throw new AnalysisException("Hive data source can only be used with tables, you can not " +
-        "write files of Hive data source directly.")
+      throw QueryCompilationErrors.cannotOperateOnHiveDataSourceFilesError("write")
     }
 
     if (source == SOURCE_NAME_MEMORY) {
       assertNotPartitioned(SOURCE_NAME_MEMORY)
       if (extraOptions.get("queryName").isEmpty) {
-        throw new AnalysisException("queryName must be specified for memory sink")
+        throw QueryCompilationErrors.queryNameNotSpecifiedForMemorySinkError()
       }
       val sink = new MemorySink()
-      val resultDf = Dataset.ofRows(df.sparkSession, new MemoryPlan(sink, df.schema.toAttributes))
+      val resultDf = Dataset.ofRows(df.sparkSession,
+        MemoryPlan(sink, DataTypeUtils.toAttributes(df.schema)))
       val recoverFromCheckpoint = outputMode == OutputMode.Complete()
-      val query = startQuery(sink, extraOptions, recoverFromCheckpoint = recoverFromCheckpoint)
+      val query = startQuery(sink, extraOptions, recoverFromCheckpoint = recoverFromCheckpoint,
+        catalogTable = catalogTable)
       resultDf.createOrReplaceTempView(query.name)
       query
     } else if (source == SOURCE_NAME_FOREACH) {
       assertNotPartitioned(SOURCE_NAME_FOREACH)
-      val sink = ForeachWriterTable[T](foreachWriter, ds.exprEnc)
-      startQuery(sink, extraOptions)
+      val sink = ForeachWriterTable[Any](foreachWriter, foreachWriterEncoder)
+      startQuery(sink, extraOptions, catalogTable = catalogTable)
     } else if (source == SOURCE_NAME_FOREACH_BATCH) {
       assertNotPartitioned(SOURCE_NAME_FOREACH_BATCH)
       if (trigger.isInstanceOf[ContinuousTrigger]) {
-        throw new AnalysisException(s"'$source' is not supported with continuous trigger")
+        throw QueryCompilationErrors.sourceNotSupportedWithContinuousTriggerError(source)
       }
       val sink = new ForeachBatchSink[T](foreachBatchWriter, ds.exprEnc)
-      startQuery(sink, extraOptions)
+      startQuery(sink, extraOptions, catalogTable = catalogTable)
     } else {
       val cls = DataSource.lookupDataSource(source, df.sparkSession.sessionState.conf)
       val disabledSources =
-        Utils.stringToSeq(df.sparkSession.sqlContext.conf.disabledV2StreamingWriters)
+        Utils.stringToSeq(df.sparkSession.sessionState.conf.disabledV2StreamingWriters)
       val useV1Source = disabledSources.contains(cls.getCanonicalName) ||
         // file source v2 does not support streaming yet.
         classOf[FileDataSourceV2].isAssignableFrom(cls)
@@ -431,7 +384,7 @@ final class DataStreamWriter[T] private[sql](ds: Dataset[T]) {
         val provider = cls.getConstructor().newInstance().asInstanceOf[TableProvider]
         val sessionOptions = DataSourceV2Utils.extractSessionConfigs(
           source = provider, conf = df.sparkSession.sessionState.conf)
-        val finalOptions = sessionOptions.filterKeys(!optionsWithPath.contains(_)).toMap ++
+        val finalOptions = sessionOptions.filter { case (k, _) => !optionsWithPath.contains(k) } ++
           optionsWithPath.originalMap
         val dsOptions = new CaseInsensitiveStringMap(finalOptions.asJava)
         // If the source accepts external table metadata, here we pass the schema of input query
@@ -454,7 +407,7 @@ final class DataStreamWriter[T] private[sql](ds: Dataset[T]) {
         createV1Sink(optionsWithPath)
       }
 
-      startQuery(sink, optionsWithPath)
+      startQuery(sink, optionsWithPath, catalogTable = catalogTable)
     }
   }
 
@@ -462,7 +415,8 @@ final class DataStreamWriter[T] private[sql](ds: Dataset[T]) {
       sink: Table,
       newOptions: CaseInsensitiveMap[String],
       recoverFromCheckpoint: Boolean = true,
-      catalogAndIdent: Option[(TableCatalog, Identifier)] = None): StreamingQuery = {
+      catalogAndIdent: Option[(TableCatalog, Identifier)] = None,
+      catalogTable: Option[CatalogTable] = None): StreamingQuery = {
     val useTempCheckpointLocation = SOURCES_ALLOW_ONE_TIME_QUERY.contains(source)
 
     df.sparkSession.sessionState.streamingQueryManager.startQuery(
@@ -475,7 +429,8 @@ final class DataStreamWriter[T] private[sql](ds: Dataset[T]) {
       useTempCheckpointLocation = useTempCheckpointLocation,
       recoverFromCheckpointLocation = recoverFromCheckpoint,
       trigger = trigger,
-      catalogAndIdent = catalogAndIdent)
+      catalogAndIdent = catalogAndIdent,
+      catalogTable = catalogTable)
   }
 
   private def createV1Sink(optionsWithPath: CaseInsensitiveMap[String]): Sink = {
@@ -494,12 +449,18 @@ final class DataStreamWriter[T] private[sql](ds: Dataset[T]) {
    * @since 2.0.0
    */
   def foreach(writer: ForeachWriter[T]): DataStreamWriter[T] = {
+    foreachImplementation(writer.asInstanceOf[ForeachWriter[Any]])
+  }
+
+  private[sql] def foreachImplementation(writer: ForeachWriter[Any],
+      encoder: Option[ExpressionEncoder[Any]] = None): DataStreamWriter[T] = {
     this.source = SOURCE_NAME_FOREACH
     this.foreachWriter = if (writer != null) {
       ds.sparkSession.sparkContext.clean(writer)
     } else {
       throw new IllegalArgumentException("foreach writer cannot be null")
     }
+    encoder.foreach(e => this.foreachWriterEncoder = e)
     this
   }
 
@@ -556,13 +517,13 @@ final class DataStreamWriter[T] private[sql](ds: Dataset[T]) {
   private def normalize(columnName: String, columnType: String): String = {
     val validColumnNames = df.logicalPlan.output.map(_.name)
     validColumnNames.find(df.sparkSession.sessionState.analyzer.resolver(_, columnName))
-      .getOrElse(throw new AnalysisException(s"$columnType column $columnName not found in " +
-        s"existing columns (${validColumnNames.mkString(", ")})"))
+      .getOrElse(throw QueryCompilationErrors.columnNotFoundInExistingColumnsError(
+        columnType, columnName, validColumnNames))
   }
 
   private def assertNotPartitioned(operation: String): Unit = {
     if (partitioningColumns.isDefined) {
-      throw new AnalysisException(s"'$operation' does not support partitioning")
+      throw QueryCompilationErrors.operationNotSupportPartitioningError(operation)
     }
   }
 
@@ -580,7 +541,10 @@ final class DataStreamWriter[T] private[sql](ds: Dataset[T]) {
 
   private var extraOptions = CaseInsensitiveMap[String](Map.empty)
 
-  private var foreachWriter: ForeachWriter[T] = null
+  private var foreachWriter: ForeachWriter[Any] = null
+
+  private var foreachWriterEncoder: ExpressionEncoder[Any] =
+    ds.exprEnc.asInstanceOf[ExpressionEncoder[Any]]
 
   private var foreachBatchWriter: (Dataset[T], Long) => Unit = null
 

@@ -79,6 +79,11 @@ private[spark] object UI {
       "reach your proxy.")
     .version("2.1.0")
     .stringConf
+    .checkValue ({ s =>
+      val words = s.split("/")
+      !words.contains("proxy") && !words.contains("history") },
+      "Cannot use the keyword 'proxy' or 'history' in reverse proxy URL. Spark UI relies on both " +
+        "keywords for getting REST API endpoints from URIs.")
     .createOptional
 
   val UI_KILL_ENABLED = ConfigBuilder("spark.ui.killEnabled")
@@ -88,7 +93,20 @@ private[spark] object UI {
     .createWithDefault(true)
 
   val UI_THREAD_DUMPS_ENABLED = ConfigBuilder("spark.ui.threadDumpsEnabled")
+    .doc("Whether to show a link for executor thread dumps in Stages and Executor pages.")
     .version("1.2.0")
+    .booleanConf
+    .createWithDefault(true)
+
+  val UI_FLAMEGRAPH_ENABLED = ConfigBuilder("spark.ui.threadDump.flamegraphEnabled")
+    .doc("Whether to render the Flamegraph for executor thread dumps")
+    .version("4.0.0")
+    .booleanConf
+    .createWithDefault(true)
+
+  val UI_HEAP_HISTOGRAM_ENABLED = ConfigBuilder("spark.ui.heapHistogramEnabled")
+    .doc("Whether to show a link for executor heap histogram in Executor page.")
+    .version("3.5.0")
     .booleanConf
     .createWithDefault(true)
 
@@ -98,7 +116,7 @@ private[spark] object UI {
       "For master/worker/driver metrics, you need to configure `conf/metrics.properties`.")
     .version("3.0.0")
     .booleanConf
-    .createWithDefault(false)
+    .createWithDefault(true)
 
   val UI_X_XSS_PROTECTION = ConfigBuilder("spark.ui.xXssProtection")
     .doc("Value for HTTP X-XSS-Protection response header")
@@ -124,10 +142,31 @@ private[spark] object UI {
     .bytesConf(ByteUnit.BYTE)
     .createWithDefaultString("8k")
 
+  val UI_TIMELINE_ENABLED = ConfigBuilder("spark.ui.timelineEnabled")
+    .doc("Whether to display event timeline data on UI pages.")
+    .version("3.4.0")
+    .booleanConf
+    .createWithDefault(true)
+
   val UI_TIMELINE_TASKS_MAXIMUM = ConfigBuilder("spark.ui.timeline.tasks.maximum")
     .version("1.4.0")
     .intConf
     .createWithDefault(1000)
+
+  val UI_TIMELINE_JOBS_MAXIMUM = ConfigBuilder("spark.ui.timeline.jobs.maximum")
+    .version("3.2.0")
+    .intConf
+    .createWithDefault(500)
+
+  val UI_TIMELINE_STAGES_MAXIMUM = ConfigBuilder("spark.ui.timeline.stages.maximum")
+    .version("3.2.0")
+    .intConf
+    .createWithDefault(500)
+
+  val UI_TIMELINE_EXECUTORS_MAXIMUM = ConfigBuilder("spark.ui.timeline.executors.maximum")
+    .version("3.2.0")
+    .intConf
+    .createWithDefault(250)
 
   val ACLS_ENABLE = ConfigBuilder("spark.acls.enable")
     .version("1.1.0")
@@ -202,5 +241,20 @@ private[spark] object UI {
     .version("3.1.0")
     .stringConf
     .transform(_.toUpperCase(Locale.ROOT))
+    .checkValues(Set("ALLOW", "LOCAL", "DENY"))
     .createWithDefault("LOCAL")
+
+  val UI_SQL_GROUP_SUB_EXECUTION_ENABLED = ConfigBuilder("spark.ui.groupSQLSubExecutionEnabled")
+    .doc("Whether to group sub executions together in SQL UI when they belong to the same " +
+      "root execution")
+    .version("3.4.0")
+    .booleanConf
+    .createWithDefault(true)
+
+  val UI_JETTY_STOP_TIMEOUT = ConfigBuilder("spark.ui.jettyStopTimeout")
+    .internal()
+    .doc("Timeout for Jetty servers started in UIs, such as SparkUI, HistoryUI, etc, to stop.")
+    .version("4.0.0")
+    .timeConf(TimeUnit.MILLISECONDS)
+    .createWithDefaultString("30s")
 }

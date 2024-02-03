@@ -19,7 +19,8 @@ package org.apache.spark.util.kvstore;
 
 import java.io.File;
 import java.io.IOException;
-import java.lang.ref.SoftReference;
+import java.lang.ref.Reference;
+import java.lang.ref.WeakReference;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentLinkedQueue;
@@ -33,6 +34,7 @@ import com.google.common.base.Preconditions;
 import com.google.common.base.Throwables;
 import org.fusesource.leveldbjni.JniDBFactory;
 import org.iq80.leveldb.DB;
+import org.iq80.leveldb.DBIterator;
 import org.iq80.leveldb.Options;
 import org.iq80.leveldb.WriteBatch;
 
@@ -69,10 +71,10 @@ public class LevelDB implements KVStore {
 
   /**
    * Trying to close a JNI LevelDB handle with a closed DB causes JVM crashes. This is used to
-   * ensure that all iterators are correctly closed before LevelDB is closed. Use soft reference
+   * ensure that all iterators are correctly closed before LevelDB is closed. Use weak references
    * to ensure that the iterator can be GCed, when it is only referenced here.
    */
-  private final ConcurrentLinkedQueue<SoftReference<LevelDBIterator<?>>> iteratorTracker;
+  private final ConcurrentLinkedQueue<Reference<LevelDBIterator<?>>> iteratorTracker;
 
   public LevelDB(File path) throws Exception {
     this(path, new KVStoreSerializer());
@@ -250,7 +252,7 @@ public class LevelDB implements KVStore {
       public Iterator<T> iterator() {
         try {
           LevelDBIterator<T> it = new LevelDBIterator<>(type, LevelDB.this, this);
-          iteratorTracker.add(new SoftReference<>(it));
+          iteratorTracker.add(new WeakReference<>(it));
           return it;
         } catch (Exception e) {
           throw Throwables.propagate(e);
@@ -269,10 +271,14 @@ public class LevelDB implements KVStore {
     KVStoreView<T> view = view(klass).index(index);
 
     for (Object indexValue : indexValues) {
-      for (T value: view.first(indexValue).last(indexValue)) {
-        Object itemKey = naturalIndex.getValue(value);
-        delete(klass, itemKey);
-        removed = true;
+      try (KVStoreIterator<T> iterator =
+        view.first(indexValue).last(indexValue).closeableIterator()) {
+        while (iterator.hasNext()) {
+          T value = iterator.next();
+          Object itemKey = naturalIndex.getValue(value);
+          delete(klass, itemKey);
+          removed = true;
+        }
       }
     }
 
@@ -301,7 +307,7 @@ public class LevelDB implements KVStore {
 
       try {
         if (iteratorTracker != null) {
-          for (SoftReference<LevelDBIterator<?>> ref: iteratorTracker) {
+          for (Reference<LevelDBIterator<?>> ref: iteratorTracker) {
             LevelDBIterator<?> it = ref.get();
             if (it != null) {
               it.close();
@@ -321,7 +327,7 @@ public class LevelDB implements KVStore {
    * Closes the given iterator if the DB is still open. Trying to close a JNI LevelDB handle
    * with a closed DB can cause JVM crashes, so this ensures that situation does not happen.
    */
-  void closeIterator(LevelDBIterator<?> it) throws IOException {
+  void closeIterator(DBIterator it) throws IOException {
     notifyIteratorClosed(it);
     synchronized (this._db) {
       DB _db = this._db.get();
@@ -335,8 +341,11 @@ public class LevelDB implements KVStore {
    * Remove iterator from iterator tracker. `LevelDBIterator` calls it to notify
    * iterator is closed.
    */
-  void notifyIteratorClosed(LevelDBIterator<?> it) {
-    iteratorTracker.removeIf(ref -> it.equals(ref.get()));
+  void notifyIteratorClosed(DBIterator dbIterator) {
+    iteratorTracker.removeIf(ref -> {
+      LevelDBIterator<?> it = ref.get();
+      return it != null && dbIterator.equals(it.internalIterator());
+    });
   }
 
   /** Returns metadata about indices for the given type. */

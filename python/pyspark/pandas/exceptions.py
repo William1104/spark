@@ -18,6 +18,7 @@
 """
 Exceptions/Errors used in pandas-on-Spark.
 """
+from typing import Optional
 
 
 class DataError(Exception):
@@ -28,24 +29,19 @@ class SparkPandasIndexingError(Exception):
     pass
 
 
-def code_change_hint(pandas_function, spark_target_function):
-    if pandas_function is not None and spark_target_function is not None:
-        return "You are trying to use pandas function {}, use spark function {}".format(
-            pandas_function, spark_target_function
-        )
-    elif pandas_function is not None and spark_target_function is None:
-        return (
-            "You are trying to use pandas function {}, checkout the spark "
-            "user guide to find a relevant function"
-        ).format(pandas_function)
-    elif pandas_function is None and spark_target_function is not None:
-        return "Use spark function {}".format(spark_target_function)
-    else:  # both none
-        return "Checkout the spark user guide to find a relevant function"
+def code_change_hint(pandas_function: str, spark_target_function: str) -> str:
+    return "You are trying to use pandas function {}, use spark function {}".format(
+        pandas_function, spark_target_function
+    )
 
 
 class SparkPandasNotImplementedError(NotImplementedError):
-    def __init__(self, pandas_function=None, spark_target_function=None, description=""):
+    def __init__(
+        self,
+        pandas_function: str,
+        spark_target_function: str,
+        description: str,
+    ):
         self.pandas_source = pandas_function
         self.spark_target = spark_target_function
         hint = code_change_hint(pandas_function, spark_target_function)
@@ -59,14 +55,17 @@ class SparkPandasNotImplementedError(NotImplementedError):
 class PandasNotImplementedError(NotImplementedError):
     def __init__(
         self,
-        class_name,
-        method_name=None,
-        arg_name=None,
-        property_name=None,
-        deprecated=False,
-        reason="",
+        class_name: str,
+        method_name: Optional[str] = None,
+        arg_name: Optional[str] = None,
+        property_name: Optional[str] = None,
+        scalar_name: Optional[str] = None,
+        deprecated: bool = False,
+        reason: str = "",
     ):
-        assert (method_name is None) != (property_name is None)
+        assert [method_name is not None, property_name is not None, scalar_name is not None].count(
+            True
+        ) == 1
         self.class_name = class_name
         self.method_name = method_name
         self.arg_name = arg_name
@@ -89,6 +88,11 @@ class PandasNotImplementedError(NotImplementedError):
                     msg = "The method `{0}.{1}()` is not implemented{2}".format(
                         class_name, method_name, reason
                     )
+        elif scalar_name is not None:
+            msg = (
+                "The scalar `{0}.{1}` is not reimplemented in pyspark.pandas;"
+                " use `pd.{1}`.".format(class_name, scalar_name)
+            )
         else:
             if deprecated:
                 msg = (
@@ -106,7 +110,7 @@ class PandasNotImplementedError(NotImplementedError):
         super().__init__(msg)
 
 
-def _test():
+def _test() -> None:
     import os
     import doctest
     import sys

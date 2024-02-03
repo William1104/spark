@@ -17,12 +17,11 @@
 
 package org.apache.spark.sql.execution.command
 
-import org.apache.spark.sql.{AnalysisException, Column, Row, SparkSession}
+import org.apache.spark.sql.{Row, SparkSession}
 import org.apache.spark.sql.catalyst.TableIdentifier
-import org.apache.spark.sql.catalyst.analysis.{NoSuchPartitionException, UnresolvedAttribute}
-import org.apache.spark.sql.catalyst.catalog.{CatalogTable, CatalogTableType, ExternalCatalogUtils}
+import org.apache.spark.sql.catalyst.catalog.{CatalogTable, CatalogTableType}
 import org.apache.spark.sql.catalyst.catalog.CatalogTypes.TablePartitionSpec
-import org.apache.spark.sql.catalyst.expressions.{And, EqualTo, Literal}
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.util.PartitioningUtils
 
 /**
@@ -58,18 +57,15 @@ case class AnalyzePartitionCommand(
       val tableId = table.identifier
       val schemaColumns = table.partitionColumnNames.mkString(",")
       val specColumns = normalizedPartitionSpec.keys.mkString(",")
-      throw new AnalysisException("The list of partition columns with values " +
-        s"in partition specification for table '${tableId.table}' " +
-        s"in database '${tableId.database.get}' is not a prefix of the list of " +
-        "partition columns defined in the table schema. " +
-        s"Expected a prefix of [${schemaColumns}], but got [${specColumns}].")
+      throw QueryCompilationErrors.unexpectedPartitionColumnPrefixError(
+        tableId.table, tableId.database.get, schemaColumns, specColumns)
     }
 
-    val filteredSpec = normalizedPartitionSpec.filter(_._2.isDefined).mapValues(_.get)
+    val filteredSpec = normalizedPartitionSpec.filter(_._2.isDefined).transform((_, v) => v.get)
     if (filteredSpec.isEmpty) {
       None
     } else {
-      Some(filteredSpec.toMap)
+      Some(filteredSpec)
     }
   }
 
@@ -79,7 +75,7 @@ case class AnalyzePartitionCommand(
     val tableIdentWithDB = TableIdentifier(tableIdent.table, Some(db))
     val tableMeta = sessionState.catalog.getTableMetadata(tableIdentWithDB)
     if (tableMeta.tableType == CatalogTableType.VIEW) {
-      throw new AnalysisException("ANALYZE TABLE is not supported on views.")
+      throw QueryCompilationErrors.analyzeTableNotSupportedOnViewsError()
     }
 
     val partitionValueSpec = getPartitionSpec(tableMeta)
@@ -88,7 +84,8 @@ case class AnalyzePartitionCommand(
 
     if (partitions.isEmpty) {
       if (partitionValueSpec.isDefined) {
-        throw new NoSuchPartitionException(db, tableIdent.table, partitionValueSpec.get)
+        throw QueryCompilationErrors.noSuchPartitionError(
+          db, tableIdent.table, partitionValueSpec.get)
       } else {
         // the user requested to analyze all partitions for a table which has no partitions
         // return normally, since there is nothing to do
@@ -101,20 +98,13 @@ case class AnalyzePartitionCommand(
       if (noscan) {
         Map.empty
       } else {
-        calculateRowCountsPerPartition(sparkSession, tableMeta, partitionValueSpec)
+        CommandUtils.calculateRowCountsPerPartition(sparkSession, tableMeta, partitionValueSpec)
       }
 
     // Update the metastore if newly computed statistics are different from those
     // recorded in the metastore.
-
-    val sizes = CommandUtils.calculateMultipleLocationSizes(sparkSession, tableMeta.identifier,
-      partitions.map(_.storage.locationUri))
-    val newPartitions = partitions.zipWithIndex.flatMap { case (p, idx) =>
-      val newRowCount = rowCounts.get(p.spec)
-      val newStats = CommandUtils.compareAndGetNewStats(p.stats, sizes(idx), newRowCount)
-      newStats.map(_ => p.copy(stats = newStats))
-    }
-
+    val (_, newPartitions) = CommandUtils.calculatePartitionStats(
+      sparkSession, tableMeta, partitions, Some(rowCounts))
     if (newPartitions.nonEmpty) {
       sessionState.catalog.alterPartitions(tableMeta.identifier, newPartitions)
     }
@@ -122,35 +112,5 @@ case class AnalyzePartitionCommand(
     Seq.empty[Row]
   }
 
-  private def calculateRowCountsPerPartition(
-      sparkSession: SparkSession,
-      tableMeta: CatalogTable,
-      partitionValueSpec: Option[TablePartitionSpec]): Map[TablePartitionSpec, BigInt] = {
-    val filter = if (partitionValueSpec.isDefined) {
-      val filters = partitionValueSpec.get.map {
-        case (columnName, value) => EqualTo(UnresolvedAttribute(columnName), Literal(value))
-      }
-      filters.reduce(And)
-    } else {
-      Literal.TrueLiteral
-    }
 
-    val tableDf = sparkSession.table(tableMeta.identifier)
-    val partitionColumns = tableMeta.partitionColumnNames.map(Column(_))
-
-    val df = tableDf.filter(Column(filter)).groupBy(partitionColumns: _*).count()
-
-    df.collect().map { r =>
-      val partitionColumnValues = partitionColumns.indices.map { i =>
-        if (r.isNullAt(i)) {
-          ExternalCatalogUtils.DEFAULT_PARTITION_NAME
-        } else {
-          r.get(i).toString
-        }
-      }
-      val spec = tableMeta.partitionColumnNames.zip(partitionColumnValues).toMap
-      val count = BigInt(r.getLong(partitionColumns.size))
-      (spec, count)
-    }.toMap
-  }
 }

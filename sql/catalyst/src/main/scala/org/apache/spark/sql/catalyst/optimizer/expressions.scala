@@ -19,18 +19,22 @@ package org.apache.spark.sql.catalyst.optimizer
 
 import scala.collection.immutable.HashSet
 import scala.collection.mutable.{ArrayBuffer, Stack}
+import scala.util.control.NonFatal
 
 import org.apache.spark.sql.catalyst.analysis._
-import org.apache.spark.sql.catalyst.expressions.{BinaryExpression, MultiLikeBase, _}
+import org.apache.spark.sql.catalyst.expressions.{MultiLikeBase, _}
 import org.apache.spark.sql.catalyst.expressions.Literal.{FalseLiteral, TrueLiteral}
 import org.apache.spark.sql.catalyst.expressions.aggregate._
 import org.apache.spark.sql.catalyst.expressions.objects.AssertNotNull
 import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules._
-import org.apache.spark.sql.catalyst.trees.TreePattern.IN
+import org.apache.spark.sql.catalyst.trees.{AlwaysProcess, TreeNodeTag}
+import org.apache.spark.sql.catalyst.trees.TreePattern._
+import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
 import org.apache.spark.unsafe.types.UTF8String
+import org.apache.spark.util.ArrayImplicits._
 
 /*
  * Optimization rules defined in this file should not affect the structure of the logical plan.
@@ -42,29 +46,58 @@ import org.apache.spark.unsafe.types.UTF8String
  * equivalent [[Literal]] values.
  */
 object ConstantFolding extends Rule[LogicalPlan] {
+  // This tag is for avoid repeatedly evaluating expression inside conditional expression
+  // which has already failed to evaluate before.
+  private[sql] val FAILED_TO_EVALUATE = TreeNodeTag[Unit]("FAILED_TO_EVALUATE")
 
   private def hasNoSideEffect(e: Expression): Boolean = e match {
     case _: Attribute => true
     case _: Literal => true
+    case c: Cast if !conf.ansiEnabled => hasNoSideEffect(c.child)
     case _: NoThrow if e.deterministic => e.children.forall(hasNoSideEffect)
     case _ => false
   }
 
-  def apply(plan: LogicalPlan): LogicalPlan = plan transform {
-    case q: LogicalPlan => q transformExpressionsDown {
-      // Skip redundant folding of literals. This rule is technically not necessary. Placing this
-      // here avoids running the next rule for Literal values, which would create a new Literal
-      // object and running eval unnecessarily.
-      case l: Literal => l
+  private def constantFolding(
+      e: Expression,
+      isConditionalBranch: Boolean = false): Expression = e match {
+    case c: ConditionalExpression if !c.foldable =>
+      c.mapChildren(constantFolding(_, isConditionalBranch = true))
 
-      case Size(c: CreateArray, _) if c.children.forall(hasNoSideEffect) =>
-        Literal(c.children.length)
-      case Size(c: CreateMap, _) if c.children.forall(hasNoSideEffect) =>
-        Literal(c.children.length / 2)
+    // Skip redundant folding of literals. This rule is technically not necessary. Placing this
+    // here avoids running the next rule for Literal values, which would create a new Literal
+    // object and running eval unnecessarily.
+    case l: Literal => l
 
-      // Fold expressions that are foldable.
-      case e if e.foldable => Literal.create(e.eval(EmptyRow), e.dataType)
-    }
+    case Size(c: CreateArray, _) if c.children.forall(hasNoSideEffect) =>
+      Literal(c.children.length)
+    case Size(c: CreateMap, _) if c.children.forall(hasNoSideEffect) =>
+      Literal(c.children.length / 2)
+
+    case e if e.getTagValue(FAILED_TO_EVALUATE).isDefined => e
+
+    // Fold expressions that are foldable.
+    case e if e.foldable =>
+      try {
+        Literal.create(e.eval(EmptyRow), e.dataType)
+      } catch {
+        case NonFatal(_) if isConditionalBranch =>
+          // When doing constant folding inside conditional expressions, we should not fail
+          // during expression evaluation, as the branch we are evaluating may not be reached at
+          // runtime, and we shouldn't fail the query, to match the original behavior.
+          e.setTagValue(FAILED_TO_EVALUATE, ())
+          e
+      }
+
+    // Replace ScalarSubquery with null if its maxRows is 0
+    case s: ScalarSubquery if s.plan.maxRows.contains(0) =>
+      Literal(null, s.dataType)
+
+    case other => other.mapChildren(constantFolding(_, isConditionalBranch))
+  }
+
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(AlwaysProcess.fn, ruleId) {
+    case q: LogicalPlan => q.mapExpressions(constantFolding(_))
   }
 }
 
@@ -82,8 +115,9 @@ object ConstantFolding extends Rule[LogicalPlan] {
  * - Using this mapping, replace occurrence of the attributes with the corresponding constant values
  *   in the AND node.
  */
-object ConstantPropagation extends Rule[LogicalPlan] with PredicateHelper {
-  def apply(plan: LogicalPlan): LogicalPlan = plan transform {
+object ConstantPropagation extends Rule[LogicalPlan] {
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformUpWithPruning(
+    _.containsAllPatterns(LITERAL, FILTER, BINARY_COMPARISON), ruleId) {
     case f: Filter =>
       val (newCondition, _) = traverse(f.condition, replaceChildren = true, nullIsFalse = true)
       if (newCondition.isDefined) {
@@ -92,8 +126,6 @@ object ConstantPropagation extends Rule[LogicalPlan] with PredicateHelper {
         f
       }
   }
-
-  type EqualityPredicates = Seq[((AttributeReference, Literal), BinaryComparison)]
 
   /**
    * Traverse a condition as a tree and replace attributes with constant values.
@@ -111,23 +143,25 @@ object ConstantPropagation extends Rule[LogicalPlan] with PredicateHelper {
    *                    resulted false
    * @return A tuple including:
    *         1. Option[Expression]: optional changed condition after traversal
-   *         2. EqualityPredicates: propagated mapping of attribute => constant
+   *         2. AttributeMap: propagated mapping of attribute => constant
    */
   private def traverse(condition: Expression, replaceChildren: Boolean, nullIsFalse: Boolean)
-    : (Option[Expression], EqualityPredicates) =
+    : (Option[Expression], AttributeMap[(Literal, BinaryComparison)]) =
     condition match {
+      case _ if !condition.containsAllPatterns(LITERAL, BINARY_COMPARISON) =>
+        (None, AttributeMap.empty)
       case e @ EqualTo(left: AttributeReference, right: Literal)
         if safeToReplace(left, nullIsFalse) =>
-        (None, Seq(((left, right), e)))
+        (None, AttributeMap(Map(left -> (right, e))))
       case e @ EqualTo(left: Literal, right: AttributeReference)
         if safeToReplace(right, nullIsFalse) =>
-        (None, Seq(((right, left), e)))
+        (None, AttributeMap(Map(right -> (left, e))))
       case e @ EqualNullSafe(left: AttributeReference, right: Literal)
         if safeToReplace(left, nullIsFalse) =>
-        (None, Seq(((left, right), e)))
+        (None, AttributeMap(Map(left -> (right, e))))
       case e @ EqualNullSafe(left: Literal, right: AttributeReference)
         if safeToReplace(right, nullIsFalse) =>
-        (None, Seq(((right, left), e)))
+        (None, AttributeMap(Map(right -> (left, e))))
       case a: And =>
         val (newLeft, equalityPredicatesLeft) =
           traverse(a.left, replaceChildren = false, nullIsFalse)
@@ -154,12 +188,12 @@ object ConstantPropagation extends Rule[LogicalPlan] with PredicateHelper {
         } else {
           None
         }
-        (newSelf, Seq.empty)
+        (newSelf, AttributeMap.empty)
       case n: Not =>
         // Ignore the EqualityPredicates from children since they are only propagated through And.
         val (newChild, _) = traverse(n.child, replaceChildren = true, nullIsFalse = false)
-        (newChild.map(Not), Seq.empty)
-      case _ => (None, Seq.empty)
+        (newChild.map(Not), AttributeMap.empty)
+      case _ => (None, AttributeMap.empty)
     }
 
   // We need to take into account if an attribute is nullable and the context of the conjunctive
@@ -170,16 +204,15 @@ object ConstantPropagation extends Rule[LogicalPlan] with PredicateHelper {
   private def safeToReplace(ar: AttributeReference, nullIsFalse: Boolean) =
     !ar.nullable || nullIsFalse
 
-  private def replaceConstants(condition: Expression, equalityPredicates: EqualityPredicates)
-    : Expression = {
-    val constantsMap = AttributeMap(equalityPredicates.map(_._1))
-    val predicates = equalityPredicates.map(_._2).toSet
-    def replaceConstants0(expression: Expression) = expression transform {
-      case a: AttributeReference => constantsMap.getOrElse(a, a)
-    }
-    condition transform {
-      case e @ EqualTo(_, _) if !predicates.contains(e) => replaceConstants0(e)
-      case e @ EqualNullSafe(_, _) if !predicates.contains(e) => replaceConstants0(e)
+  private def replaceConstants(
+      condition: Expression,
+      equalityPredicates: AttributeMap[(Literal, BinaryComparison)]): Expression = {
+    val constantsMap = AttributeMap(equalityPredicates.map { case (attr, (lit, _)) => attr -> lit })
+    val predicates = equalityPredicates.values.map(_._2).toSet
+    condition.transformWithPruning(_.containsPattern(BINARY_COMPARISON)) {
+      case b: BinaryComparison if !predicates.contains(b) => b transform {
+        case a: AttributeReference => constantsMap.getOrElse(a, a)
+      }
     }
   }
 }
@@ -210,14 +243,15 @@ object ReorderAssociativeOperator extends Rule[LogicalPlan] {
     case _ => ExpressionSet(Seq.empty)
   }
 
-  def apply(plan: LogicalPlan): LogicalPlan = plan transform {
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(
+    _.containsPattern(BINARY_ARITHMETIC), ruleId) {
     case q: LogicalPlan =>
       // We have to respect aggregate expressions which exists in grouping expressions when plan
       // is an Aggregate operator, otherwise the optimized expression could not be derived from
       // grouping expressions.
       // TODO: do not reorder consecutive `Add`s or `Multiply`s with different `failOnError` flags
       val groupingExpressionSet = collectGroupingExpressions(q)
-      q transformExpressionsDown {
+      q.transformExpressionsDownWithPruning(_.containsPattern(BINARY_ARITHMETIC)) {
       case a @ Add(_, _, f) if a.deterministic && a.dataType.isInstanceOf[IntegralType] =>
         val (foldables, others) = flattenAdd(a, groupingExpressionSet).partition(_.foldable)
         if (foldables.size > 1) {
@@ -254,9 +288,13 @@ object OptimizeIn extends Rule[LogicalPlan] {
     _.containsPattern(IN), ruleId) {
     case q: LogicalPlan => q.transformExpressionsDownWithPruning(_.containsPattern(IN), ruleId) {
       case In(v, list) if list.isEmpty =>
-        // When v is not nullable, the following expression will be optimized
-        // to FalseLiteral which is tested in OptimizeInSuite.scala
-        If(IsNotNull(v), FalseLiteral, Literal(null, BooleanType))
+        // IN (empty list) is always false under current behavior.
+        // Under legacy behavior it's null if the left side is null, otherwise false (SPARK-44550).
+        if (!SQLConf.get.legacyNullInEmptyBehavior) {
+          FalseLiteral
+        } else {
+          If(IsNotNull(v), FalseLiteral, Literal(null, BooleanType))
+        }
       case expr @ In(v, list) if expr.inSetConvertible =>
         val newList = ExpressionSet(list).toSeq
         if (newList.length == 1
@@ -286,8 +324,10 @@ object OptimizeIn extends Rule[LogicalPlan] {
  * 4. Removes `Not` operator.
  */
 object BooleanSimplification extends Rule[LogicalPlan] with PredicateHelper {
-  def apply(plan: LogicalPlan): LogicalPlan = plan transform {
-    case q: LogicalPlan => q transformExpressionsUp {
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(
+    _.containsAnyPattern(AND, OR, NOT), ruleId) {
+    case q: LogicalPlan => q.transformExpressionsUpWithPruning(
+      _.containsAnyPattern(AND, OR, NOT), ruleId) {
       case TrueLiteral And e => e
       case e And TrueLiteral => e
       case FalseLiteral Or e => e
@@ -445,6 +485,7 @@ object BooleanSimplification extends Rule[LogicalPlan] with PredicateHelper {
  * 1) Replace '<=>' with 'true' literal.
  * 2) Replace '=', '<=', and '>=' with 'true' literal if both operands are non-nullable.
  * 3) Replace '<' and '>' with 'false' literal if both operands are non-nullable.
+ * 4) Unwrap '=', '<=>' if one side is a boolean literal
  */
 object SimplifyBinaryComparison
   extends Rule[LogicalPlan] with PredicateHelper with ConstraintHelper {
@@ -460,7 +501,8 @@ object SimplifyBinaryComparison
     }
   }
 
-  def apply(plan: LogicalPlan): LogicalPlan = plan transform {
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(
+    _.containsPattern(BINARY_COMPARISON), ruleId) {
     case l: LogicalPlan =>
       lazy val notNullExpressions = ExpressionSet(l match {
         case Filter(fc, _) =>
@@ -470,7 +512,7 @@ object SimplifyBinaryComparison
         case _ => Seq.empty
       })
 
-      l transformExpressionsUp {
+      l.transformExpressionsUpWithPruning(_.containsPattern(BINARY_COMPARISON)) {
         // True with equality
         case a EqualNullSafe b if a.semanticEquals(b) => TrueLiteral
         case a EqualTo b if canSimplifyComparison(a, b, notNullExpressions) => TrueLiteral
@@ -481,6 +523,16 @@ object SimplifyBinaryComparison
         // False with inequality
         case a GreaterThan b if canSimplifyComparison(a, b, notNullExpressions) => FalseLiteral
         case a LessThan b if canSimplifyComparison(a, b, notNullExpressions) => FalseLiteral
+
+        // Optimize equalities when one side is Literal in order to help pushing down the filters
+        case a EqualTo TrueLiteral => a
+        case TrueLiteral EqualTo b => b
+        case a EqualTo FalseLiteral => Not(a)
+        case FalseLiteral EqualTo b => Not(b)
+        case a EqualNullSafe TrueLiteral if !a.nullable => a
+        case TrueLiteral EqualNullSafe b if !b.nullable => b
+        case a EqualNullSafe FalseLiteral if !a.nullable => Not(a)
+        case FalseLiteral EqualNullSafe b if !b.nullable => Not(b)
       }
   }
 }
@@ -489,14 +541,15 @@ object SimplifyBinaryComparison
 /**
  * Simplifies conditional expressions (if / case).
  */
-object SimplifyConditionals extends Rule[LogicalPlan] with PredicateHelper {
+object SimplifyConditionals extends Rule[LogicalPlan] {
   private def falseOrNullLiteral(e: Expression): Boolean = e match {
     case FalseLiteral => true
     case Literal(null, _) => true
     case _ => false
   }
 
-  def apply(plan: LogicalPlan): LogicalPlan = plan transform {
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(
+    _.containsAnyPattern(IF, CASE_WHEN), ruleId) {
     case q: LogicalPlan => q transformExpressionsUp {
       case If(TrueLiteral, trueValue, _) => trueValue
       case If(FalseLiteral, _, falseValue) => falseValue
@@ -557,8 +610,14 @@ object SimplifyConditionals extends Rule[LogicalPlan] with PredicateHelper {
         if (i == 0) {
           elseValue
         } else {
-          e.copy(branches = branches.take(i).map(branch => (branch._1, elseValue)))
+          e.copy(
+            branches = branches.take(i).map(branch => (branch._1, elseValue)),
+            elseValue = elseOpt.filterNot(_.semanticEquals(Literal(null, e.dataType))))
         }
+
+      case e @ CaseWhen(_, elseOpt)
+          if elseOpt.exists(_.semanticEquals(Literal(null, e.dataType))) =>
+        e.copy(elseValue = None)
     }
   }
 }
@@ -567,13 +626,12 @@ object SimplifyConditionals extends Rule[LogicalPlan] with PredicateHelper {
 /**
  * Push the foldable expression into (if / case) branches.
  */
-object PushFoldableIntoBranches extends Rule[LogicalPlan] with PredicateHelper {
+object PushFoldableIntoBranches extends Rule[LogicalPlan] {
 
   // To be conservative here: it's only a guaranteed win if all but at most only one branch
   // end up being not foldable.
   private def atMostOneUnfoldable(exprs: Seq[Expression]): Boolean = {
-    val (foldables, others) = exprs.partition(_.foldable)
-    foldables.nonEmpty && others.length < 2
+    exprs.count(!_.foldable) < 2
   }
 
   // Not all UnaryExpression can be pushed into (if / case) branches, e.g. Alias.
@@ -582,77 +640,83 @@ object PushFoldableIntoBranches extends Rule[LogicalPlan] with PredicateHelper {
     case _: UnaryMathExpression | _: Abs | _: Bin | _: Factorial | _: Hex => true
     case _: String2StringExpression | _: Ascii | _: Base64 | _: BitLength | _: Chr | _: Length =>
       true
-    case _: CastBase => true
+    case _: Cast => true
+    case _: TryEval => true
     case _: GetDateField | _: LastDay => true
-    case _: ExtractIntervalPart => true
+    case _: ExtractIntervalPart[_] => true
     case _: ArraySetLike => true
     case _: ExtractValue => true
     case _ => false
   }
 
-  // Not all BinaryExpression can be pushed into (if / case) branches.
-  private def supportedBinaryExpression(e: BinaryExpression): Boolean = e match {
-    case _: BinaryComparison | _: StringPredicate | _: StringRegexExpression => true
-    case _: BinaryArithmetic => true
-    case _: BinaryMathExpression => true
-    case _: AddMonths | _: DateAdd | _: DateAddInterval | _: DateDiff | _: DateSub |
-         _: DateAddYMInterval | _: TimestampAddYMInterval | _: TimeAdd => true
-    case _: FindInSet | _: RoundBase => true
-    case _ => false
-  }
-
-  def apply(plan: LogicalPlan): LogicalPlan = plan transform {
-    case q: LogicalPlan => q transformExpressionsUp {
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(
+    _.containsAnyPattern(CASE_WHEN, IF), ruleId) {
+    case q: LogicalPlan => q.transformExpressionsUpWithPruning(
+      _.containsAnyPattern(CASE_WHEN, IF), ruleId) {
       case u @ UnaryExpression(i @ If(_, trueValue, falseValue))
           if supportedUnaryExpression(u) && atMostOneUnfoldable(Seq(trueValue, falseValue)) =>
         i.copy(
-          trueValue = u.withNewChildren(Array(trueValue)),
-          falseValue = u.withNewChildren(Array(falseValue)))
+          trueValue = u.withNewChildren(Array(trueValue).toImmutableArraySeq),
+          falseValue = u.withNewChildren(Array(falseValue).toImmutableArraySeq))
 
       case u @ UnaryExpression(c @ CaseWhen(branches, elseValue))
           if supportedUnaryExpression(u) && atMostOneUnfoldable(branches.map(_._2) ++ elseValue) =>
         c.copy(
-          branches.map(e => e.copy(_2 = u.withNewChildren(Array(e._2)))),
-          elseValue.map(e => u.withNewChildren(Array(e))))
+          branches.map(e => e.copy(_2 = u.withNewChildren(Array(e._2).toImmutableArraySeq))),
+          Some(u.withNewChildren(
+            Array(elseValue.getOrElse(Literal(null, c.dataType))).toImmutableArraySeq)))
 
-      case b @ BinaryExpression(i @ If(_, trueValue, falseValue), right)
-          if supportedBinaryExpression(b) && right.foldable &&
-            atMostOneUnfoldable(Seq(trueValue, falseValue)) =>
+      case SupportedBinaryExpr(b, i @ If(_, trueValue, falseValue), right)
+          if right.foldable && atMostOneUnfoldable(Seq(trueValue, falseValue)) =>
         i.copy(
-          trueValue = b.withNewChildren(Array(trueValue, right)),
-          falseValue = b.withNewChildren(Array(falseValue, right)))
+          trueValue = b.withNewChildren(Array(trueValue, right).toImmutableArraySeq),
+          falseValue = b.withNewChildren(Array(falseValue, right).toImmutableArraySeq))
 
-      case b @ BinaryExpression(left, i @ If(_, trueValue, falseValue))
-          if supportedBinaryExpression(b) && left.foldable &&
-            atMostOneUnfoldable(Seq(trueValue, falseValue)) =>
+      case SupportedBinaryExpr(b, left, i @ If(_, trueValue, falseValue))
+          if left.foldable && atMostOneUnfoldable(Seq(trueValue, falseValue)) =>
         i.copy(
-          trueValue = b.withNewChildren(Array(left, trueValue)),
-          falseValue = b.withNewChildren(Array(left, falseValue)))
+          trueValue = b.withNewChildren(Array(left, trueValue).toImmutableArraySeq),
+          falseValue = b.withNewChildren(Array(left, falseValue).toImmutableArraySeq))
 
-      case b @ BinaryExpression(c @ CaseWhen(branches, elseValue), right)
-          if supportedBinaryExpression(b) && right.foldable &&
-            atMostOneUnfoldable(branches.map(_._2) ++ elseValue) =>
+      case SupportedBinaryExpr(b, c @ CaseWhen(branches, elseValue), right)
+          if right.foldable && atMostOneUnfoldable(branches.map(_._2) ++ elseValue) =>
         c.copy(
-          branches.map(e => e.copy(_2 = b.withNewChildren(Array(e._2, right)))),
-          elseValue.map(e => b.withNewChildren(Array(e, right))))
+          branches.map(e => e.copy(_2 = b.withNewChildren(Array(e._2, right).toImmutableArraySeq))),
+          Some(b.withNewChildren(
+            Array(elseValue.getOrElse(Literal(null, c.dataType)), right).toImmutableArraySeq)))
 
-      case b @ BinaryExpression(left, c @ CaseWhen(branches, elseValue))
-          if supportedBinaryExpression(b) && left.foldable &&
-            atMostOneUnfoldable(branches.map(_._2) ++ elseValue) =>
+      case SupportedBinaryExpr(b, left, c @ CaseWhen(branches, elseValue))
+          if left.foldable && atMostOneUnfoldable(branches.map(_._2) ++ elseValue) =>
         c.copy(
-          branches.map(e => e.copy(_2 = b.withNewChildren(Array(left, e._2)))),
-          elseValue.map(e => b.withNewChildren(Array(left, e))))
+          branches.map(e => e.copy(_2 = b.withNewChildren(Array(left, e._2).toImmutableArraySeq))),
+          Some(b.withNewChildren(
+            Array(left, elseValue.getOrElse(Literal(null, c.dataType))).toImmutableArraySeq)))
     }
   }
 }
 
+object SupportedBinaryExpr {
+  def unapply(expr: Expression): Option[(Expression, Expression, Expression)] = expr match {
+    case _: BinaryComparison | _: StringPredicate | _: StringRegexExpression =>
+      Some(expr, expr.children.head, expr.children.last)
+    case _: BinaryArithmetic => Some(expr, expr.children.head, expr.children.last)
+    case _: BinaryMathExpression => Some(expr, expr.children.head, expr.children.last)
+    case _: AddMonths | _: DateAdd | _: DateAddInterval | _: DateDiff | _: DateSub |
+         _: DateAddYMInterval | _: TimestampAddYMInterval | _: TimeAdd =>
+      Some(expr, expr.children.head, expr.children.last)
+    case _: FindInSet | _: RoundBase => Some(expr, expr.children.head, expr.children.last)
+    case BinaryPredicate(expr) =>
+      Some(expr, expr.arguments.head, expr.arguments.last)
+    case _ => None
+  }
+}
 
 /**
  * Simplifies LIKE expressions that do not need full regular expressions to evaluate the condition.
  * For example, when the expression is just checking to see if a string starts with a given
  * pattern.
  */
-object LikeSimplification extends Rule[LogicalPlan] {
+object LikeSimplification extends Rule[LogicalPlan] with PredicateHelper {
   // if guards below protect from escapes on trailing %.
   // Cases like "something\%" are not optimized, but this does not affect correctness.
   private val startsWith = "([^_%]+)%".r
@@ -703,17 +767,24 @@ object LikeSimplification extends Rule[LogicalPlan] {
       multi
     } else {
       multi match {
-        case l: LikeAll => And(replacements.reduceLeft(And), l.copy(patterns = remainPatterns))
+        case l: LikeAll =>
+          val and = buildBalancedPredicate(replacements, And)
+          if (remainPatterns.nonEmpty) And(and, l.copy(patterns = remainPatterns)) else and
         case l: NotLikeAll =>
-          And(replacements.map(Not(_)).reduceLeft(And), l.copy(patterns = remainPatterns))
-        case l: LikeAny => Or(replacements.reduceLeft(Or), l.copy(patterns = remainPatterns))
+          val and = buildBalancedPredicate(replacements.map(Not(_)), And)
+          if (remainPatterns.nonEmpty) And(and, l.copy(patterns = remainPatterns)) else and
+        case l: LikeAny =>
+          val or = buildBalancedPredicate(replacements, Or)
+          if (remainPatterns.nonEmpty) Or(or, l.copy(patterns = remainPatterns)) else or
         case l: NotLikeAny =>
-          Or(replacements.map(Not(_)).reduceLeft(Or), l.copy(patterns = remainPatterns))
+          val or = buildBalancedPredicate(replacements.map(Not(_)), Or)
+          if (remainPatterns.nonEmpty) Or(or, l.copy(patterns = remainPatterns)) else or
       }
     }
   }
 
-  def apply(plan: LogicalPlan): LogicalPlan = plan transformAllExpressions {
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformAllExpressionsWithPruning(
+    _.containsPattern(LIKE_FAMLIY), ruleId) {
     case l @ Like(input, Literal(pattern, StringType), escapeChar) =>
       if (pattern == null) {
         // If pattern is null, return null value directly, since "col like null" == null.
@@ -721,10 +792,14 @@ object LikeSimplification extends Rule[LogicalPlan] {
       } else {
         simplifyLike(input, pattern.toString, escapeChar).getOrElse(l)
       }
-    case l @ LikeAll(child, patterns) => simplifyMultiLike(child, patterns, l)
-    case l @ NotLikeAll(child, patterns) => simplifyMultiLike(child, patterns, l)
-    case l @ LikeAny(child, patterns) => simplifyMultiLike(child, patterns, l)
-    case l @ NotLikeAny(child, patterns) => simplifyMultiLike(child, patterns, l)
+    case l @ LikeAll(child, patterns) if CollapseProject.isCheap(child) =>
+      simplifyMultiLike(child, patterns, l)
+    case l @ NotLikeAll(child, patterns) if CollapseProject.isCheap(child) =>
+      simplifyMultiLike(child, patterns, l)
+    case l @ LikeAny(child, patterns) if CollapseProject.isCheap(child) =>
+      simplifyMultiLike(child, patterns, l)
+    case l @ NotLikeAny(child, patterns) if CollapseProject.isCheap(child) =>
+      simplifyMultiLike(child, patterns, l)
   }
 }
 
@@ -740,9 +815,13 @@ object NullPropagation extends Rule[LogicalPlan] {
     case _ => false
   }
 
-  def apply(plan: LogicalPlan): LogicalPlan = plan transform {
-    case q: LogicalPlan => q transformExpressionsUp {
-      case e @ WindowExpression(Cast(Literal(0L, _), _, _), _) =>
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(
+    t => t.containsAnyPattern(NULL_CHECK, NULL_LITERAL, COUNT, COALESCE)
+      || t.containsAllPatterns(WINDOW_EXPRESSION, CAST, LITERAL), ruleId) {
+    case q: LogicalPlan => q.transformExpressionsUpWithPruning(
+      t => t.containsAnyPattern(NULL_CHECK, NULL_LITERAL, COUNT, COALESCE)
+        || t.containsAllPatterns(WINDOW_EXPRESSION, CAST, LITERAL), ruleId) {
+      case e @ WindowExpression(Cast(Literal(0L, _), _, _, _), _) =>
         Cast(Literal(0L), e.dataType, Option(conf.sessionLocalTimeZone))
       case e @ AggregateExpression(Count(exprs), _, _, _, _) if exprs.forall(isNullLiteral) =>
         Cast(Literal(0L), e.dataType, Option(conf.sessionLocalTimeZone))
@@ -766,17 +845,70 @@ object NullPropagation extends Rule[LogicalPlan] {
         } else if (newChildren.length == 1) {
           newChildren.head
         } else {
-          Coalesce(newChildren)
+          val nonNullableIndex = newChildren.indexWhere(e => !e.nullable)
+          if (nonNullableIndex > -1) {
+            Coalesce(newChildren.take(nonNullableIndex + 1))
+          } else {
+            Coalesce(newChildren)
+          }
         }
 
-      // If the value expression is NULL then transform the In expression to null literal.
-      case In(Literal(null, _), _) => Literal.create(null, BooleanType)
-      case InSubquery(Seq(Literal(null, _)), _) => Literal.create(null, BooleanType)
+      // If the list is empty, transform the In expression to false literal.
+      case In(_, list)
+        if list.isEmpty && !SQLConf.get.legacyNullInEmptyBehavior =>
+        Literal.create(false, BooleanType)
+      // If the value expression is NULL (and the list is non-empty), then transform the
+      // In expression to null literal.
+      // If the legacy flag is set, then it becomes null even if the list is empty (which is
+      // incorrect legacy behavior)
+      case In(Literal(null, _), list)
+        if list.nonEmpty || SQLConf.get.legacyNullInEmptyBehavior
+      => Literal.create(null, BooleanType)
+      case InSubquery(Seq(Literal(null, _)), _)
+        if SQLConf.get.legacyNullInEmptyBehavior =>
+        Literal.create(null, BooleanType)
+      case InSubquery(Seq(Literal(null, _)), ListQuery(sub, _, _, _, conditions, _))
+        if !SQLConf.get.legacyNullInEmptyBehavior
+        && conditions.isEmpty =>
+        If(Exists(sub), Literal(null, BooleanType), FalseLiteral)
 
       // Non-leaf NullIntolerant expressions will return null, if at least one of its children is
       // a null literal.
       case e: NullIntolerant if e.children.exists(isNullLiteral) =>
         Literal.create(null, e.dataType)
+    }
+  }
+}
+
+
+/**
+ * Unwrap the input of IsNull/IsNotNull if the input is NullIntolerant
+ * E.g. IsNull(Not(null)) == IsNull(null)
+ */
+object NullDownPropagation extends Rule[LogicalPlan] {
+  // Return true iff the expression returns non-null result for all non-null inputs.
+  // Not all `NullIntolerant` can be propagated. E.g. `Cast` is `NullIntolerant`; however,
+  // cast('Infinity' as integer) is null. Hence, `Cast` is not supported `NullIntolerant`.
+  // `ExtractValue` is also not supported. E.g. the planner may resolve column `a` to `a#123`,
+  // then IsNull(a#123) cannot be optimized.
+  // Applying to `EqualTo` is too disruptive for [SPARK-32290] optimization, not supported for now.
+  // If e has multiple children, the deterministic check is required because optimizing
+  // IsNull(a > b) to Or(IsNull(a), IsNull(b)), for example, may cause skipping the evaluation of b
+  private def supportedNullIntolerant(e: NullIntolerant): Boolean = (e match {
+    case _: Not => true
+    case _: GreaterThan | _: GreaterThanOrEqual | _: LessThan | _: LessThanOrEqual
+      if e.deterministic => true
+    case _ => false
+  }) && e.children.nonEmpty
+
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(
+    _.containsPattern(NULL_CHECK), ruleId) {
+    case q: LogicalPlan => q.transformExpressionsDownWithPruning(
+      _.containsPattern(NULL_CHECK), ruleId) {
+      case IsNull(e: NullIntolerant) if supportedNullIntolerant(e) =>
+        e.children.map(IsNull(_): Expression).reduceLeft(Or)
+      case IsNotNull(e: NullIntolerant) if supportedNullIntolerant(e) =>
+        e.children.map(IsNotNull(_): Expression).reduceLeft(And)
     }
   }
 }
@@ -849,7 +981,7 @@ object FoldablePropagation extends Rule[LogicalPlan] {
       case j: Join =>
         val (newChildren, foldableMaps) = j.children.map(propagateFoldables).unzip
         val foldableMap = AttributeMap(
-          foldableMaps.foldLeft(Iterable.empty[(Attribute, Alias)])(_ ++ _.baseMap.values).toSeq)
+          foldableMaps.foldLeft(Iterable.empty[(Attribute, Alias)])(_ ++ _.baseMap.values))
         val newJoin =
           replaceFoldable(j.withNewChildren(newChildren).asInstanceOf[Join], foldableMap)
         val missDerivedAttrsSet: AttributeSet = AttributeSet(newJoin.joinType match {
@@ -861,7 +993,7 @@ object FoldablePropagation extends Rule[LogicalPlan] {
         })
         val newFoldableMap = AttributeMap(foldableMap.baseMap.values.filterNot {
           case (attr, _) => missDerivedAttrsSet.contains(attr)
-        }.toSeq)
+        })
         (newJoin, newFoldableMap)
 
       // For other plans, they are not safe to apply foldable propagation, and they should not
@@ -900,12 +1032,14 @@ object FoldablePropagation extends Rule[LogicalPlan] {
     case _: Sample => true
     case _: GlobalLimit => true
     case _: LocalLimit => true
+    case _: Offset => true
     case _: Generate => true
     case _: Distinct => true
     case _: AppendColumns => true
     case _: AppendColumnsWithObject => true
     case _: RepartitionByExpression => true
     case _: Repartition => true
+    case _: RebalancePartitions => true
     case _: Sort => true
     case _: TypedFilter => true
     case _ => false
@@ -917,15 +1051,26 @@ object FoldablePropagation extends Rule[LogicalPlan] {
  * Removes [[Cast Casts]] that are unnecessary because the input is already the correct type.
  */
 object SimplifyCasts extends Rule[LogicalPlan] {
-  def apply(plan: LogicalPlan): LogicalPlan = plan transformAllExpressions {
-    case Cast(e, dataType, _) if e.dataType == dataType => e
-    case c @ Cast(e, dataType, _) => (e.dataType, dataType) match {
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformAllExpressionsWithPruning(
+    _.containsPattern(CAST), ruleId) {
+    case Cast(e, dataType, _, _) if e.dataType == dataType => e
+    case c @ Cast(Cast(e, dt1: NumericType, _, _), dt2: NumericType, _, _)
+        if isWiderCast(e.dataType, dt1) && isWiderCast(dt1, dt2) =>
+      c.copy(child = e)
+    case c @ Cast(e, dataType, _, _) => (e.dataType, dataType) match {
       case (ArrayType(from, false), ArrayType(to, true)) if from == to => e
       case (MapType(fromKey, fromValue, false), MapType(toKey, toValue, true))
         if fromKey == toKey && fromValue == toValue => e
       case _ => c
       }
+    case IsNotNull(Cast(e, dataType: NumericType, _, _)) if isWiderCast(e.dataType, dataType) =>
+      IsNotNull(e)
   }
+
+  // Returns whether the from DataType can be safely casted to the to DataType without losing
+  // any precision or range.
+  private def isWiderCast(from: DataType, to: NumericType): Boolean =
+    from.isInstanceOf[NumericType] && Cast.canUpCast(from, to)
 }
 
 
@@ -933,7 +1078,8 @@ object SimplifyCasts extends Rule[LogicalPlan] {
  * Removes nodes that are not necessary.
  */
 object RemoveDispensableExpressions extends Rule[LogicalPlan] {
-  def apply(plan: LogicalPlan): LogicalPlan = plan transformAllExpressions {
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformAllExpressionsWithPruning(
+    _.containsPattern(UNARY_POSITIVE), ruleId) {
     case UnaryPositive(child) => child
   }
 }
@@ -944,8 +1090,10 @@ object RemoveDispensableExpressions extends Rule[LogicalPlan] {
  * the inner conversion is overwritten by the outer one.
  */
 object SimplifyCaseConversionExpressions extends Rule[LogicalPlan] {
-  def apply(plan: LogicalPlan): LogicalPlan = plan transform {
-    case q: LogicalPlan => q transformExpressionsUp {
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(
+    _.containsPattern(UPPER_OR_LOWER), ruleId) {
+    case q: LogicalPlan => q.transformExpressionsUpWithPruning(
+      _.containsPattern(UPPER_OR_LOWER), ruleId) {
       case Upper(Upper(child)) => Upper(child)
       case Upper(Lower(child)) => Upper(child)
       case Lower(Upper(child)) => Lower(child)
@@ -970,7 +1118,7 @@ object CombineConcats extends Rule[LogicalPlan] {
         // If `spark.sql.function.concatBinaryAsString` is false, nested `Concat` exprs possibly
         // have `Concat`s with binary output. Since `TypeCoercion` casts them into strings,
         // we need to handle the case to combine all nested `Concat`s.
-        case c @ Cast(Concat(children), StringType, _) =>
+        case c @ Cast(Concat(children), StringType, _, _) =>
           val newChildren = children.map { e => c.copy(child = e) }
           stack.pushAll(newChildren.reverse)
         case child =>
@@ -982,11 +1130,12 @@ object CombineConcats extends Rule[LogicalPlan] {
 
   private def hasNestedConcats(concat: Concat): Boolean = concat.children.exists {
     case c: Concat => true
-    case c @ Cast(Concat(children), StringType, _) => true
+    case c @ Cast(Concat(children), StringType, _, _) => true
     case _ => false
   }
 
-  def apply(plan: LogicalPlan): LogicalPlan = plan.transformExpressionsDown {
+  def apply(plan: LogicalPlan): LogicalPlan = plan.transformAllExpressionsWithPruning(
+    _.containsPattern(CONCAT), ruleId) {
     case concat: Concat if hasNestedConcats(concat) =>
       flattenConcats(concat)
   }

@@ -20,6 +20,7 @@ package org.apache.spark.sql.execution.streaming.state
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.expressions.{Attribute, UnsafeRow}
 import org.apache.spark.sql.catalyst.expressions.codegen.{GenerateUnsafeProjection, GenerateUnsafeRowJoiner}
+import org.apache.spark.sql.catalyst.types.DataTypeUtils
 import org.apache.spark.sql.types.StructType
 
 /**
@@ -92,7 +93,7 @@ abstract class StreamingAggregationStateManagerBaseImpl(
 
   override def keys(store: ReadStateStore): Iterator[UnsafeRow] = {
     // discard and don't convert values to avoid computation
-    store.getRange(None, None).map(_.key)
+    store.iterator().map(_.key)
   }
 }
 
@@ -160,8 +161,8 @@ class StreamingAggregationStateManagerImplV2(
     GenerateUnsafeProjection.generate(valueExpressions, inputRowAttributes)
 
   @transient private lazy val joiner =
-    GenerateUnsafeRowJoiner.create(StructType.fromAttributes(keyExpressions),
-      StructType.fromAttributes(valueExpressions))
+    GenerateUnsafeRowJoiner.create(DataTypeUtils.fromAttributes(keyExpressions),
+      DataTypeUtils.fromAttributes(valueExpressions))
   @transient private lazy val restoreValueProjector = GenerateUnsafeProjection.generate(
     inputRowAttributes, keyValueJoinedExpressions)
 

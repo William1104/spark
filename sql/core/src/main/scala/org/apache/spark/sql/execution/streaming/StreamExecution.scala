@@ -17,29 +17,28 @@
 
 package org.apache.spark.sql.execution.streaming
 
-import java.io.{InterruptedIOException, IOException, UncheckedIOException}
+import java.io.{InterruptedIOException, UncheckedIOException}
 import java.nio.channels.ClosedByInterruptException
 import java.util.UUID
 import java.util.concurrent.{CountDownLatch, ExecutionException, TimeoutException, TimeUnit}
 import java.util.concurrent.atomic.AtomicReference
 import java.util.concurrent.locks.ReentrantLock
 
-import scala.collection.JavaConverters._
 import scala.collection.mutable.{Map => MutableMap}
+import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
 import com.google.common.util.concurrent.UncheckedExecutionException
 import org.apache.hadoop.fs.Path
 
-import org.apache.spark.{SparkContext, SparkException}
+import org.apache.spark.{JobArtifactSet, SparkContext, SparkException, SparkThrowable}
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql._
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.streaming.InternalOutputModes._
 import org.apache.spark.sql.connector.catalog.{SupportsWrite, Table}
 import org.apache.spark.sql.connector.read.streaming.{Offset => OffsetV2, ReadLimit, SparkDataStream}
-import org.apache.spark.sql.connector.write.{LogicalWriteInfoImpl, SupportsTruncate}
-import org.apache.spark.sql.connector.write.streaming.StreamingWrite
+import org.apache.spark.sql.connector.write.{LogicalWriteInfoImpl, SupportsTruncate, Write}
 import org.apache.spark.sql.execution.command.StreamingExplainCommand
 import org.apache.spark.sql.execution.datasources.v2.StreamWriterCommitProgress
 import org.apache.spark.sql.internal.SQLConf
@@ -187,6 +186,9 @@ abstract class StreamExecution(
   /* Get the call site in the caller thread; will pass this into the micro batch thread */
   private val callSite = Utils.getCallSite()
 
+  /* Make sure we propagate the ArtifactSet to the micro batch thread. */
+  private val jobArtifactState = JobArtifactSet.getCurrentJobArtifactState.orNull
+
   /** Used to report metrics to coda-hale. This uses id for easier tracking across restarts. */
   lazy val streamMetrics = new MetricsReporter(
     this, s"spark.streaming.${Option(name).getOrElse(id)}")
@@ -205,7 +207,9 @@ abstract class StreamExecution(
         // To fix call site like "run at <unknown>:0", we bridge the call site from the caller
         // thread to this micro batch thread
         sparkSession.sparkContext.setCallSite(callSite)
-        runStream()
+        JobArtifactSet.withActiveJobArtifactState(jobArtifactState) {
+          runStream()
+        }
       }
     }
 
@@ -236,6 +240,10 @@ abstract class StreamExecution(
   /** Returns the path of a file with `name` in the checkpoint directory. */
   protected def checkpointFile(name: String): String =
     new Path(new Path(resolvedCheckpointRoot), name).toString
+
+  /** All checkpoint file operations should be performed through `CheckpointFileManager`. */
+  private val fileManager = CheckpointFileManager.create(new Path(resolvedCheckpointRoot),
+      sparkSession.sessionState.newHadoopConf())
 
   /**
    * Starts the execution. This returns only after the thread has started and [[QueryStartedEvent]]
@@ -284,6 +292,11 @@ abstract class StreamExecution(
         // Disable cost-based join optimization as we do not want stateful operations
         // to be rearranged
         sparkSessionForStream.conf.set(SQLConf.CBO_ENABLED.key, "false")
+        // Disable any config affecting the required child distribution of stateful operators.
+        // Please read through the NOTE on the classdoc of StatefulOpClusteredDistribution for
+        // details.
+        sparkSessionForStream.conf.set(SQLConf.REQUIRE_ALL_CLUSTER_KEYS_FOR_DISTRIBUTION.key,
+          "false")
 
         updateStatusMessage("Initializing sources")
         // force initialization of the logical plan so that the sources can be created
@@ -305,21 +318,24 @@ abstract class StreamExecution(
       case e if isInterruptedByStop(e, sparkSession.sparkContext) =>
         // interrupted by stop()
         updateStatusMessage("Stopped")
-      case e: IOException if e.getMessage != null
-        && e.getMessage.startsWith(classOf[InterruptedException].getName)
-        && state.get == TERMINATED =>
-        // This is a workaround for HADOOP-12074: `Shell.runCommand` converts `InterruptedException`
-        // to `new IOException(ie.toString())` before Hadoop 2.8.
-        updateStatusMessage("Stopped")
       case e: Throwable =>
+        val message = if (e.getMessage == null) "" else e.getMessage
         streamDeathCause = new StreamingQueryException(
           toDebugString(includeLogicalPlan = isInitialized),
-          s"Query $prettyIdString terminated with exception: ${e.getMessage}",
-          e,
+          cause = e,
           committedOffsets.toOffsetSeq(sources, offsetSeqMetadata).toString,
-          availableOffsets.toOffsetSeq(sources, offsetSeqMetadata).toString)
+          availableOffsets.toOffsetSeq(sources, offsetSeqMetadata).toString,
+          errorClass = "STREAM_FAILED",
+          messageParameters = Map(
+            "id" -> id.toString,
+            "runId" -> runId.toString,
+            "message" -> message,
+            "queryDebugString" -> toDebugString(includeLogicalPlan = isInitialized),
+            "startOffset" -> committedOffsets.toOffsetSeq(sources, offsetSeqMetadata).toString,
+            "endOffset" -> availableOffsets.toOffsetSeq(sources, offsetSeqMetadata).toString
+          ))
         logError(s"Query $prettyIdString terminated with error", e)
-        updateStatusMessage(s"Terminated with exception: ${e.getMessage}")
+        updateStatusMessage(s"Terminated with exception: $message")
         // Rethrow the fatal errors to allow the user using `Thread.UncaughtExceptionHandler` to
         // handle them
         if (!NonFatal(e)) {
@@ -337,6 +353,7 @@ abstract class StreamExecution(
 
       try {
         stopSources()
+        cleanup()
         state.set(TERMINATED)
         currentStatus = status.copy(isTriggerActive = false, isDataAvailable = false)
 
@@ -345,8 +362,15 @@ abstract class StreamExecution(
 
         // Notify others
         sparkSession.streams.notifyQueryTermination(StreamExecution.this)
+        val errorClassOpt = exception.flatMap {
+          _.cause match {
+            case t: SparkThrowable => Some(t.getErrorClass)
+            case _ => None
+          }
+        }
         postEvent(
-          new QueryTerminatedEvent(id, runId, exception.map(_.cause).map(Utils.exceptionString)))
+          new QueryTerminatedEvent(id, runId, exception.map(_.cause).map(Utils.exceptionString),
+            errorClassOpt))
 
         // Delete the temp checkpoint when either force delete enabled or the query didn't fail
         if (deleteCheckpointOnStop &&
@@ -355,8 +379,7 @@ abstract class StreamExecution(
           val checkpointPath = new Path(resolvedCheckpointRoot)
           try {
             logInfo(s"Deleting checkpoint $checkpointPath.")
-            val fs = checkpointPath.getFileSystem(sparkSession.sessionState.newHadoopConf())
-            fs.delete(checkpointPath, true)
+            fileManager.delete(checkpointPath)
           } catch {
             case NonFatal(e) =>
               // Deleting temp checkpoint folder is best effort, don't throw non fatal exceptions
@@ -401,6 +424,12 @@ abstract class StreamExecution(
     }
   }
 
+
+  /**
+   * Any clean up that needs to happen when the query is stopped or exits
+   */
+  protected def cleanup(): Unit = {}
+
   /**
    * Interrupts the query execution thread and awaits its termination until until it exceeds the
    * timeout. The timeout can be set on "spark.sql.streaming.stopTimeout".
@@ -410,7 +439,7 @@ abstract class StreamExecution(
   @throws[TimeoutException]
   protected def interruptAndAwaitExecutionThreadTermination(): Unit = {
     val timeout = math.max(
-      sparkSession.sessionState.conf.getConf(SQLConf.STREAMING_STOP_TIMEOUT), 0)
+      sparkSession.conf.get(SQLConf.STREAMING_STOP_TIMEOUT), 0)
     queryExecutionThread.interrupt()
     queryExecutionThread.join(timeout)
     if (queryExecutionThread.isAlive) {
@@ -438,7 +467,15 @@ abstract class StreamExecution(
         false
       } else {
         val source = sources(sourceIndex)
-        !localCommittedOffsets.contains(source) || localCommittedOffsets(source) != newOffset
+        // SPARK-39242 For numeric increasing offsets, we could have called awaitOffset
+        // after the stream has moved past the expected newOffset or if committedOffsets
+        // changed after notify. In this case, its safe to exit, since at-least the given
+        // Offset has been reached and the equality condition might never be met.
+        (localCommittedOffsets.get(source), newOffset) match {
+          case (Some(LongOffset(localOffVal)), LongOffset(newOffVal)) => localOffVal < newOffVal
+          case (Some(localOff), newOff) => localOff != newOff
+          case (None, newOff) => true
+        }
       }
     }
 
@@ -575,16 +612,16 @@ abstract class StreamExecution(
         |batch = $batchDescription""".stripMargin
   }
 
-  protected def createStreamingWrite(
+  protected def createWrite(
       table: SupportsWrite,
       options: Map[String, String],
-      inputPlan: LogicalPlan): StreamingWrite = {
+      inputPlan: LogicalPlan): Write = {
     val info = LogicalWriteInfoImpl(
       queryId = id.toString,
       inputPlan.schema,
       new CaseInsensitiveStringMap(options.asJava))
     val writeBuilder = table.newWriteBuilder(info)
-    val write = outputMode match {
+    outputMode match {
       case Append =>
         writeBuilder.build()
 
@@ -599,7 +636,6 @@ abstract class StreamExecution(
           table.name + " does not support Update mode.")
         writeBuilder.asInstanceOf[SupportsStreamingUpdateAsAppend].build()
     }
-    write.toStreaming
   }
 
   protected def purge(threshold: Long): Unit = {
@@ -612,7 +648,15 @@ abstract class StreamExecution(
 object StreamExecution {
   val QUERY_ID_KEY = "sql.streaming.queryId"
   val IS_CONTINUOUS_PROCESSING = "__is_continuous_processing"
+  val IO_EXCEPTION_NAMES = Seq(
+    classOf[InterruptedException].getName,
+    classOf[InterruptedIOException].getName,
+    classOf[ClosedByInterruptException].getName)
+  val PROXY_ERROR = (
+    "py4j.protocol.Py4JJavaError: An error occurred while calling" +
+    s".+(\\r\\n|\\r|\\n): (${IO_EXCEPTION_NAMES.mkString("|")})").r
 
+  @scala.annotation.tailrec
   def isInterruptionException(e: Throwable, sc: SparkContext): Boolean = e match {
     // InterruptedIOException - thrown when an I/O operation is interrupted
     // ClosedByInterruptException - thrown when an I/O operation upon a channel is interrupted
@@ -640,6 +684,10 @@ object StreamExecution {
       } else {
         false
       }
+    // py4j.Py4JException - with pinned thread mode on, the exception can be interrupted by Py4J
+    //                      access, for example, in `DataFrameWriter.foreachBatch`. See also
+    //                      SPARK-39218.
+    case e: py4j.Py4JException => PROXY_ERROR.findFirstIn(e.getMessage).isDefined
     case _ =>
       false
   }

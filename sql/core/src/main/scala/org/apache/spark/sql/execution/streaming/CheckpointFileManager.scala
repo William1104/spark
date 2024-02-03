@@ -16,7 +16,7 @@
  */
 package org.apache.spark.sql.execution.streaming
 
-import java.io.{FileNotFoundException, IOException, OutputStream}
+import java.io.{FileNotFoundException, OutputStream}
 import java.util.{EnumSet, UUID}
 
 import scala.util.control.NonFatal
@@ -27,6 +27,7 @@ import org.apache.hadoop.fs.local.{LocalFs, RawLocalFs}
 import org.apache.hadoop.fs.permission.FsPermission
 
 import org.apache.spark.internal.Logging
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.streaming.CheckpointFileManager.RenameHelperMethods
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.util.Utils
@@ -64,10 +65,10 @@ trait CheckpointFileManager {
   /** Open a file for reading, or throw exception if it does not exist. */
   def open(path: Path): FSDataInputStream
 
-  /** List the files in a path that match a filter. */
+  /** List the files/directories in a path that match a filter. */
   def list(path: Path, filter: PathFilter): Array[FileStatus]
 
-  /** List all the files in a path. */
+  /** List all the files/directories in a path. */
   def list(path: Path): Array[FileStatus] = {
     list(path, (_: Path) => true)
   }
@@ -83,6 +84,12 @@ trait CheckpointFileManager {
 
   /** Is the default file system this implementation is operating on the local file system. */
   def isLocal: Boolean
+
+  /**
+   * Creates the checkpoint path if it does not exist, and returns the qualified
+   * checkpoint path.
+   */
+  def createCheckpointDirectory(): Path
 }
 
 object CheckpointFileManager extends Logging {
@@ -151,6 +158,13 @@ object CheckpointFileManager extends Logging {
               s"Failed to rename temp file $tempPath to $finalPath because file exists", fe)
             if (!overwriteIfPossible) throw fe
         }
+
+        // Optionally, check if the renamed file exists
+        if (SQLConf.get.checkpointRenamedFileCheck && !fm.exists(finalPath)) {
+          throw new IllegalStateException(s"Renamed temp file $tempPath to $finalPath. " +
+            s"But $finalPath does not exist.")
+        }
+
         logInfo(s"Renamed temp file $tempPath to $finalPath")
       } finally {
         terminated = true
@@ -205,8 +219,8 @@ object CheckpointFileManager extends Logging {
   }
 
   private def generateTempPath(path: Path): Path = {
-    val tc = org.apache.spark.TaskContext.get
-    val tid = if (tc != null) ".TID" + tc.taskAttemptId else ""
+    val tc = org.apache.spark.TaskContext.get()
+    val tid = if (tc != null) ".TID" + tc.taskAttemptId() else ""
     new Path(path.getParent, s".${path.getName}.${UUID.randomUUID}${tid}.tmp")
   }
 }
@@ -242,17 +256,11 @@ class FileSystemBasedCheckpointFileManager(path: Path, hadoopConf: Configuration
     fs.open(path)
   }
 
-  override def exists(path: Path): Boolean =
-    try {
-      fs.getFileStatus(path) != null
-    } catch {
-      case _: FileNotFoundException => false
-    }
+  override def exists(path: Path): Boolean = fs.exists(path)
 
   override def renameTempFile(srcPath: Path, dstPath: Path, overwriteIfPossible: Boolean): Unit = {
     if (!overwriteIfPossible && fs.exists(dstPath)) {
-      throw new FileAlreadyExistsException(
-        s"Failed to rename $srcPath to $dstPath as destination already exists")
+      throw QueryExecutionErrors.renamePathAsExistsPathError(srcPath, dstPath)
     }
 
     if (!fs.rename(srcPath, dstPath)) {
@@ -260,14 +268,14 @@ class FileSystemBasedCheckpointFileManager(path: Path, hadoopConf: Configuration
       // This tries to make a best effort attempt to return the most appropriate exception.
       if (fs.exists(dstPath)) {
         if (!overwriteIfPossible) {
-          throw new FileAlreadyExistsException(s"Failed to rename as $dstPath already exists")
+          throw QueryExecutionErrors.renameAsExistsPathError(dstPath)
         }
       } else if (!fs.exists(srcPath)) {
-        throw new FileNotFoundException(s"Failed to rename as $srcPath was not found")
+        throw QueryExecutionErrors.renameSrcPathNotFoundError(srcPath)
       } else {
-        val msg = s"Failed to rename temp file $srcPath to $dstPath as rename returned false"
-        logWarning(msg)
-        throw new IOException(msg)
+        val e = QueryExecutionErrors.failedRenameTempFileError(srcPath, dstPath)
+        logWarning(e.getMessage)
+        throw e
       }
     }
   }
@@ -285,16 +293,19 @@ class FileSystemBasedCheckpointFileManager(path: Path, hadoopConf: Configuration
     case _: LocalFileSystem | _: RawLocalFileSystem => true
     case _ => false
   }
+
+  override def createCheckpointDirectory(): Path = {
+    val qualifiedPath = fs.makeQualified(path)
+    fs.mkdirs(qualifiedPath, FsPermission.getDirDefault)
+    qualifiedPath
+  }
 }
 
 
-/** An implementation of [[CheckpointFileManager]] using Hadoop's [[FileContext]] API. */
-class FileContextBasedCheckpointFileManager(path: Path, hadoopConf: Configuration)
-  extends CheckpointFileManager with RenameHelperMethods with Logging {
+abstract class AbstractFileContextBasedCheckpointFileManager(path: Path, hadoopConf: Configuration)
+  extends CheckpointFileManager with Logging {
 
-  import CheckpointFileManager._
-
-  private val fc = if (path.toUri.getScheme == null) {
+  protected val fc = if (path.toUri.getScheme == null) {
     FileContext.getFileContext(hadoopConf)
   } else {
     FileContext.getFileContext(path.toUri, hadoopConf)
@@ -308,19 +319,6 @@ class FileContextBasedCheckpointFileManager(path: Path, hadoopConf: Configuratio
     fc.mkdir(path, FsPermission.getDirDefault, true)
   }
 
-  override def createTempFile(path: Path): FSDataOutputStream = {
-    import CreateFlag._
-    import Options._
-    fc.create(
-      path, EnumSet.of(CREATE, OVERWRITE), CreateOpts.checksumParam(ChecksumOpt.createDisabled()))
-  }
-
-  override def createAtomic(
-      path: Path,
-      overwriteIfPossible: Boolean): CancellableFSDataOutputStream = {
-    new RenameBasedFSDataOutputStream(this, path, overwriteIfPossible)
-  }
-
   override def open(path: Path): FSDataInputStream = {
     fc.open(path)
   }
@@ -328,14 +326,6 @@ class FileContextBasedCheckpointFileManager(path: Path, hadoopConf: Configuratio
   override def exists(path: Path): Boolean = {
     fc.util.exists(path)
   }
-
-  override def renameTempFile(srcPath: Path, dstPath: Path, overwriteIfPossible: Boolean): Unit = {
-    import Options.Rename._
-    fc.rename(srcPath, dstPath, if (overwriteIfPossible) OVERWRITE else NONE)
-    // TODO: this is a workaround of HADOOP-16255 - remove this when HADOOP-16255 is resolved
-    mayRemoveCrcFile(srcPath)
-  }
-
 
   override def delete(path: Path): Unit = {
     try {
@@ -351,16 +341,35 @@ class FileContextBasedCheckpointFileManager(path: Path, hadoopConf: Configuratio
     case _ => false
   }
 
-  private def mayRemoveCrcFile(path: Path): Unit = {
-    try {
-      val checksumFile = new Path(path.getParent, s".${path.getName}.crc")
-      if (exists(checksumFile)) {
-        // checksum file exists, deleting it
-        delete(checksumFile)
-      }
-    } catch {
-      case NonFatal(_) => // ignore, we are removing crc file as "best-effort"
-    }
+  override def createCheckpointDirectory(): Path = {
+    val qualifiedPath = fc.makeQualified(path)
+    fc.mkdir(qualifiedPath, FsPermission.getDirDefault, true)
+    qualifiedPath
+  }
+}
+
+class FileContextBasedCheckpointFileManager(path: Path, hadoopConf: Configuration)
+  extends AbstractFileContextBasedCheckpointFileManager(path, hadoopConf)
+  with RenameHelperMethods {
+
+  import CheckpointFileManager._
+
+  override def createTempFile(path: Path): FSDataOutputStream = {
+    import CreateFlag._
+    import Options._
+    fc.create(
+      path, EnumSet.of(CREATE, OVERWRITE), CreateOpts.checksumParam(ChecksumOpt.createDisabled()))
+  }
+
+  override def createAtomic(
+      path: Path,
+      overwriteIfPossible: Boolean): CancellableFSDataOutputStream = {
+    new RenameBasedFSDataOutputStream(this, path, overwriteIfPossible)
+  }
+
+  override def renameTempFile(srcPath: Path, dstPath: Path, overwriteIfPossible: Boolean): Unit = {
+    import Options.Rename._
+    fc.rename(srcPath, dstPath, if (overwriteIfPossible) OVERWRITE else NONE)
   }
 }
 

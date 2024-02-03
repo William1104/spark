@@ -22,6 +22,7 @@ import org.apache.spark.sql.catalyst.plans.QueryPlan
 import org.apache.spark.sql.catalyst.rules.RuleId
 import org.apache.spark.sql.catalyst.rules.UnknownRuleId
 import org.apache.spark.sql.catalyst.trees.{AlwaysProcess, CurrentOrigin, TreePatternBits}
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.util.Utils
 
 
@@ -176,10 +177,14 @@ trait AnalysisHelper extends QueryPlan[LogicalPlan] { self: LogicalPlan =>
             self.markRuleAsIneffective(ruleId)
             self
           } else {
+            rewritten_plan.copyTagsFrom(self)
             rewritten_plan
           }
         } else {
-          afterRule.mapChildren(_.resolveOperatorsDownWithPruning(cond, ruleId)(rule))
+          val newPlan = afterRule
+            .mapChildren(_.resolveOperatorsDownWithPruning(cond, ruleId)(rule))
+          newPlan.copyTagsFrom(self)
+          newPlan
         }
       }
     } else {
@@ -249,7 +254,7 @@ trait AnalysisHelper extends QueryPlan[LogicalPlan] { self: LogicalPlan =>
     if (Utils.isTesting &&
         AnalysisHelper.inAnalyzer.get > 0 &&
         AnalysisHelper.resolveOperatorDepth.get == 0) {
-      throw new RuntimeException("This method should not be called in the analyzer")
+      throw QueryExecutionErrors.methodCalledInAnalyzerNotAllowedError()
     }
   }
 

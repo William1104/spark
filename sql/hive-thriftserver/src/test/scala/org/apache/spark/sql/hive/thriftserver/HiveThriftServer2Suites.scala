@@ -23,34 +23,35 @@ import java.nio.charset.StandardCharsets
 import java.sql.{Date, DriverManager, SQLException, Statement}
 import java.util.{Locale, UUID}
 
-import scala.collection.JavaConverters._
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
-import scala.concurrent.{ExecutionContext, Future, Promise}
+import scala.concurrent.{ExecutionContext, ExecutionContextExecutorService, Future, Promise}
 import scala.concurrent.duration._
 import scala.io.Source
+import scala.jdk.CollectionConverters._
 import scala.util.Try
 
 import com.google.common.io.Files
 import org.apache.hadoop.hive.conf.HiveConf.ConfVars
 import org.apache.hive.jdbc.HiveDriver
 import org.apache.hive.service.auth.PlainSaslHelper
-import org.apache.hive.service.cli.{FetchOrientation, FetchType, GetInfoType, RowSet}
+import org.apache.hive.service.cli.{CLIService, FetchOrientation, FetchType, GetInfoType, RowSetFactory}
 import org.apache.hive.service.cli.thrift.ThriftCLIServiceClient
 import org.apache.hive.service.rpc.thrift.TCLIService.Client
+import org.apache.hive.service.rpc.thrift.TRowSet
 import org.apache.thrift.protocol.TBinaryProtocol
 import org.apache.thrift.transport.TSocket
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.concurrent.Eventually._
 
 import org.apache.spark.{SparkException, SparkFunSuite}
+import org.apache.spark.ProcessTestUtils.ProcessOutputCapturer
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.hive.HiveUtils
 import org.apache.spark.sql.hive.test.HiveTestJars
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.internal.StaticSQLConf.HIVE_THRIFT_SERVER_SINGLESESSION
-import org.apache.spark.sql.test.ProcessTestUtils.ProcessOutputCapturer
-import org.apache.spark.util.{ThreadUtils, Utils}
+import org.apache.spark.util.{ShutdownHookManager, ThreadUtils, Utils}
 
 object TestData {
   def getTestDataFilePath(name: String): URL = {
@@ -66,7 +67,7 @@ class HiveThriftBinaryServerSuite extends HiveThriftServer2Test {
 
   private def withCLIServiceClient(f: ThriftCLIServiceClient => Unit): Unit = {
     // Transport creation logic below mimics HiveConnection.createBinaryTransport
-    val rawTransport = new TSocket("localhost", serverPort)
+    val rawTransport = new TSocket(localhost, serverPort)
     val user = System.getProperty("user.name")
     val transport = PlainSaslHelper.getPlainTransport(user, "anonymous", rawTransport)
     val protocol = new TBinaryProtocol(transport)
@@ -123,7 +124,7 @@ class HiveThriftBinaryServerSuite extends HiveThriftServer2Test {
             1000,
             FetchType.QUERY_OUTPUT)
 
-          rows_next.numRows()
+          RowSetFactory.create(rows_next, sessionHandle.getProtocolVersion).numRows()
         }
 
         // Fetch result second time from first row
@@ -135,7 +136,7 @@ class HiveThriftBinaryServerSuite extends HiveThriftServer2Test {
             1000,
             FetchType.QUERY_OUTPUT)
 
-          rows_first.numRows()
+          RowSetFactory.create(rows_first, sessionHandle.getProtocolVersion).numRows()
         }
       }
     }
@@ -440,7 +441,7 @@ class HiveThriftBinaryServerSuite extends HiveThriftServer2Test {
         s"LOAD DATA LOCAL INPATH '${TestData.smallKv}' OVERWRITE INTO TABLE test_map")
 
       queries.foreach(statement.execute)
-      implicit val ec = ExecutionContext.fromExecutorService(
+      implicit val ec: ExecutionContextExecutorService = ExecutionContext.fromExecutorService(
         ThreadUtils.newDaemonSingleThreadExecutor("test-jdbc-cancel"))
       try {
         // Start a very-long-running query that will take hours to finish, then cancel it in order
@@ -637,12 +638,11 @@ class HiveThriftBinaryServerSuite extends HiveThriftServer2Test {
       val user = System.getProperty("user.name")
       val sessionHandle = client.openSession(user, "")
       val sessionID = sessionHandle.getSessionId
-
-      assert(pipeoutFileList(sessionID).length == 2)
+      assert(pipeoutFileList(sessionID) === null)
 
       client.closeSession(sessionHandle)
 
-      assert(pipeoutFileList(sessionID).length == 0)
+      assert(pipeoutFileList(sessionID) === null)
     }
   }
 
@@ -664,11 +664,34 @@ class HiveThriftBinaryServerSuite extends HiveThriftServer2Test {
 
   test("Support interval type") {
     withJdbcStatement() { statement =>
-      val rs = statement.executeQuery("SELECT interval 3 months 1 hours")
+      val rs = statement.executeQuery("SELECT interval 5 years 7 months")
       assert(rs.next())
-      assert(rs.getString(1) === "3 months 1 hours")
+      assert(rs.getString(1) === "5-7")
     }
+    withJdbcStatement() { statement =>
+      val rs = statement.executeQuery("SELECT interval 8 days 10 hours 5 minutes 10 seconds")
+      assert(rs.next())
+      assert(rs.getString(1) === "8 10:05:10.000000000")
+    }
+    withJdbcStatement() { statement =>
+      val rs = statement.executeQuery("SELECT interval 3 days 1 hours")
+      assert(rs.next())
+      assert(rs.getString(1) === "3 01:00:00.000000000")
+    }
+
     // Invalid interval value
+    withJdbcStatement() { statement =>
+      val e = intercept[SQLException] {
+        statement.executeQuery("SELECT interval 5 yea 7 months")
+      }
+      assert(e.getMessage.contains("org.apache.spark.sql.catalyst.parser.ParseException"))
+    }
+    withJdbcStatement() { statement =>
+      val e = intercept[SQLException] {
+        statement.executeQuery("SELECT interval 8 days 10 hours 5 minutes 10 secon")
+      }
+      assert(e.getMessage.contains("org.apache.spark.sql.catalyst.parser.ParseException"))
+    }
     withJdbcStatement() { statement =>
       val e = intercept[SQLException] {
         statement.executeQuery("SELECT interval 3 months 1 hou")
@@ -716,8 +739,8 @@ class HiveThriftBinaryServerSuite extends HiveThriftServer2Test {
            |  AND v1.c = v2.c
            |""".stripMargin)
       while (rs.next()) {
-        assert(rs.getString("a1") === "1 days")
-        assert(rs.getString("a2") === "1 days")
+        assert(rs.getString("a1") === "1 00:00:00.000000000")
+        assert(rs.getString("a2") === "1 00:00:00.000000000")
         assert(rs.getString("b1") === "2-1")
         assert(rs.getString("b2") === "2-1")
         assert(rs.getString("c1") === "3 01:01:01.000000000")
@@ -727,10 +750,11 @@ class HiveThriftBinaryServerSuite extends HiveThriftServer2Test {
   }
 
   test("ThriftCLIService FetchResults FETCH_FIRST, FETCH_NEXT, FETCH_PRIOR") {
-    def checkResult(rows: RowSet, start: Long, end: Long): Unit = {
-      assert(rows.getStartOffset() == start)
-      assert(rows.numRows() == end - start)
-      rows.iterator.asScala.zip((start until end).iterator).foreach { case (row, v) =>
+    def checkResult(rows: TRowSet, start: Long, end: Long): Unit = {
+      val rowSet = RowSetFactory.create(rows, CLIService.SERVER_VERSION)
+      assert(rowSet.getStartOffset == start)
+      assert(rowSet.numRows() == end - start)
+      rowSet.iterator.asScala.zip((start until end).iterator).foreach { case (row, v) =>
         assert(row(0).asInstanceOf[Long] === v)
       }
     }
@@ -744,7 +768,7 @@ class HiveThriftBinaryServerSuite extends HiveThriftServer2Test {
         sessionHandle,
         "SELECT * FROM range(10)",
         confOverlay) // 10 rows result with sequence 0, 1, 2, ..., 9
-      var rows: RowSet = null
+      var rows: TRowSet = null
 
       // Fetch 5 rows with FETCH_NEXT
       rows = client.fetchResults(
@@ -846,7 +870,7 @@ class HiveThriftBinaryServerSuite extends HiveThriftServer2Test {
             FetchOrientation.FETCH_NEXT,
             1000,
             FetchType.QUERY_OUTPUT)
-          rows_next.numRows()
+          RowSetFactory.create(rows_next, sessionHandle.getProtocolVersion).numRows()
         }
       }
     }
@@ -1165,6 +1189,7 @@ abstract class HiveThriftServer2TestBase extends SparkFunSuite with BeforeAndAft
   protected val startScript = "../../sbin/start-thriftserver.sh".split("/").mkString(File.separator)
   protected val stopScript = "../../sbin/stop-thriftserver.sh".split("/").mkString(File.separator)
 
+  val localhost = Utils.localCanonicalHostName()
   private var listeningPort: Int = _
   protected def serverPort: Int = listeningPort
 
@@ -1193,18 +1218,20 @@ abstract class HiveThriftServer2TestBase extends SparkFunSuite with BeforeAndAft
     }
 
     val driverClassPath = {
-      // Writes a temporary log4j.properties and prepend it to driver classpath, so that it
+      // Writes a temporary log4j2.properties and prepend it to driver classpath, so that it
       // overrides all other potential log4j configurations contained in other dependency jar files.
       val tempLog4jConf = Utils.createTempDir().getCanonicalPath
 
       Files.write(
-        """log4j.rootCategory=INFO, console
-          |log4j.appender.console=org.apache.log4j.ConsoleAppender
-          |log4j.appender.console.target=System.err
-          |log4j.appender.console.layout=org.apache.log4j.PatternLayout
-          |log4j.appender.console.layout.ConversionPattern=%d{yy/MM/dd HH:mm:ss} %p %c{1}: %m%n
+        """rootLogger.level = info
+          |rootLogger.appenderRef.stdout.ref = console
+          |appender.console.type = Console
+          |appender.console.name = console
+          |appender.console.target = SYSTEM_ERR
+          |appender.console.layout.type = PatternLayout
+          |appender.console.layout.pattern = %d{HH:mm:ss.SSS} %p %c: %maxLen{%m}{512}%n%ex{8}%n
         """.stripMargin,
-        new File(s"$tempLog4jConf/log4j.properties"),
+        new File(s"$tempLog4jConf/log4j2.properties"),
         StandardCharsets.UTF_8)
 
       tempLog4jConf
@@ -1214,13 +1241,13 @@ abstract class HiveThriftServer2TestBase extends SparkFunSuite with BeforeAndAft
        |  --master local
        |  --hiveconf ${ConfVars.METASTORECONNECTURLKEY}=$metastoreJdbcUri
        |  --hiveconf ${ConfVars.METASTOREWAREHOUSE}=$warehousePath
-       |  --hiveconf ${ConfVars.HIVE_SERVER2_THRIFT_BIND_HOST}=localhost
+       |  --hiveconf ${ConfVars.HIVE_SERVER2_THRIFT_BIND_HOST}=$localhost
        |  --hiveconf ${ConfVars.HIVE_SERVER2_TRANSPORT_MODE}=$mode
        |  --hiveconf ${ConfVars.HIVE_SERVER2_LOGGING_OPERATION_LOG_LOCATION}=$operationLogPath
        |  --hiveconf ${ConfVars.LOCALSCRATCHDIR}=$lScratchDir
        |  --hiveconf $portConf=0
        |  --driver-class-path $driverClassPath
-       |  --driver-java-options -Dlog4j.debug
+       |  --driver-java-options -Dlog4j2.debug
        |  --conf spark.ui.enabled=false
        |  ${extraConf.mkString("\n")}
      """.stripMargin.split("\\s+").toSeq
@@ -1316,33 +1343,36 @@ abstract class HiveThriftServer2TestBase extends SparkFunSuite with BeforeAndAft
       process
     }
 
+    ShutdownHookManager.addShutdownHook(stopThriftServer _)
     ThreadUtils.awaitResult(serverStarted.future, SERVER_STARTUP_TIMEOUT)
   }
 
   private def stopThriftServer(): Unit = {
-    // The `spark-daemon.sh' script uses kill, which is not synchronous, have to wait for a while.
-    Utils.executeAndGetOutput(
-      command = Seq(stopScript),
-      extraEnvironment = Map("SPARK_PID_DIR" -> pidDir.getCanonicalPath))
-    Thread.sleep(3.seconds.toMillis)
+    if (pidDir.list.nonEmpty) {
+      // The `spark-daemon.sh' script uses kill, which is not synchronous, have to wait for a while.
+      Utils.executeAndGetOutput(
+        command = Seq(stopScript),
+        extraEnvironment = Map("SPARK_PID_DIR" -> pidDir.getCanonicalPath))
+      Thread.sleep(3.seconds.toMillis)
 
-    warehousePath.delete()
-    warehousePath = null
+      warehousePath.delete()
+      warehousePath = null
 
-    metastorePath.delete()
-    metastorePath = null
+      metastorePath.delete()
+      metastorePath = null
 
-    operationLogPath.delete()
-    operationLogPath = null
+      operationLogPath.delete()
+      operationLogPath = null
 
-    lScratchDir.delete()
-    lScratchDir = null
+      lScratchDir.delete()
+      lScratchDir = null
 
-    Option(logPath).foreach(_.delete())
-    logPath = null
+      Option(logPath).foreach(_.delete())
+      logPath = null
 
-    Option(logTailingProcess).foreach(_.destroy())
-    logTailingProcess = null
+      Option(logTailingProcess).foreach(_.destroy())
+      logTailingProcess = null
+    }
   }
 
   private def dumpLogs(): Unit = {
@@ -1356,6 +1386,11 @@ abstract class HiveThriftServer2TestBase extends SparkFunSuite with BeforeAndAft
          |End HiveThriftServer2Suite failure output
          |=========================================
        """.stripMargin)
+  }
+
+  override def beforeEach(): Unit = {
+    super.beforeEach()
+    System.gc()
   }
 
   override protected def beforeAll(): Unit = {
@@ -1394,14 +1429,14 @@ abstract class HiveThriftServer2TestBase extends SparkFunSuite with BeforeAndAft
   Utils.classForName(classOf[HiveDriver].getCanonicalName)
 
   protected def jdbcUri(database: String = "default"): String = if (mode == ServerMode.http) {
-    s"""jdbc:hive2://localhost:$serverPort/
+    s"""jdbc:hive2://$localhost:$serverPort/
        |$database?
        |hive.server2.transport.mode=http;
        |hive.server2.thrift.http.path=cliservice;
        |${hiveConfList}#${hiveVarList}
      """.stripMargin.split("\n").mkString.trim
   } else {
-    s"jdbc:hive2://localhost:$serverPort/$database?${hiveConfList}#${hiveVarList}"
+    s"jdbc:hive2://$localhost:$serverPort/$database?${hiveConfList}#${hiveVarList}"
   }
 
   private def tryCaptureSysLog(f: => Unit): Unit = {

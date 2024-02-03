@@ -17,7 +17,6 @@
 
 package org.apache.spark.sql.execution.streaming
 
-import java.net.URI
 import java.util.concurrent.ThreadPoolExecutor
 import java.util.concurrent.TimeUnit._
 
@@ -28,13 +27,16 @@ import org.apache.hadoop.fs.{FileStatus, FileSystem, GlobFilter, Path}
 
 import org.apache.spark.deploy.SparkHadoopUtil
 import org.apache.spark.internal.Logging
+import org.apache.spark.paths.SparkPath
 import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
 import org.apache.spark.sql.catalyst.util.CaseInsensitiveMap
 import org.apache.spark.sql.connector.read.streaming
-import org.apache.spark.sql.connector.read.streaming.{ReadAllAvailable, ReadLimit, ReadMaxFiles, SupportsAdmissionControl}
+import org.apache.spark.sql.connector.read.streaming.{ReadAllAvailable, ReadLimit, ReadMaxFiles, SupportsAdmissionControl, SupportsTriggerAvailableNow}
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.execution.datasources.{DataSource, InMemoryFileIndex, LogicalRelation}
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.ThreadUtils
 
 /**
@@ -47,7 +49,11 @@ class FileStreamSource(
     override val schema: StructType,
     partitionColumns: Seq[String],
     metadataPath: String,
-    options: Map[String, String]) extends SupportsAdmissionControl with Source with Logging {
+    options: Map[String, String])
+  extends SupportsAdmissionControl
+  with SupportsTriggerAvailableNow
+  with Source
+  with Logging {
 
   import FileStreamSource._
 
@@ -64,12 +70,15 @@ class FileStreamSource(
   private val sourceCleaner: Option[FileStreamSourceCleaner] = FileStreamSourceCleaner(
     fs, qualifiedBasePath, sourceOptions, hadoopConf)
 
-  private val optionsWithPartitionBasePath = sourceOptions.optionMapWithoutPath ++ {
-    if (!SparkHadoopUtil.get.isGlobPath(new Path(path)) && options.contains("path")) {
-      Map("basePath" -> path)
-    } else {
-      Map()
-    }}
+  private val optionsForInnerDataSource = sourceOptions.optionMapWithoutPath ++ {
+    val pathOption =
+      if (!SparkHadoopUtil.get.isGlobPath(new Path(path)) && options.contains("path")) {
+        Map("basePath" -> path)
+      } else {
+        Map()
+      }
+    pathOption ++ Map(DataSource.GLOB_PATHS_KEY -> "false")
+  }
 
   private val metadataLog =
     new FileStreamSourceLog(FileStreamSourceLog.VERSION, sparkSession, metadataPath)
@@ -104,14 +113,16 @@ class FileStreamSource(
   // Visible for testing and debugging in production.
   val seenFiles = new SeenFilesMap(maxFileAgeMs, fileNameOnly)
 
+  private var allFilesForTriggerAvailableNow: Seq[(SparkPath, Long)] = _
+
   metadataLog.restore().foreach { entry =>
-    seenFiles.add(entry.path, entry.timestamp)
+    seenFiles.add(entry.sparkPath, entry.timestamp)
   }
   seenFiles.purge()
 
   logInfo(s"maxFilesPerBatch = $maxFilesPerBatch, maxFileAgeMs = $maxFileAgeMs")
 
-  private var unreadFiles: Seq[(String, Long)] = _
+  private var unreadFiles: Seq[(SparkPath, Long)] = _
 
   /**
    * Returns the maximum offset that can be retrieved from the source.
@@ -125,7 +136,13 @@ class FileStreamSource(
       unreadFiles
     } else {
       // All the new files found - ignore aged files and files that we have seen.
-      fetchAllFiles().filter {
+      // Use the pre-fetched list of files when Trigger.AvailableNow is enabled.
+      val allFiles = if (allFilesForTriggerAvailableNow != null) {
+        allFilesForTriggerAvailableNow
+      } else {
+        fetchAllFiles()
+      }
+      allFiles.filter {
         case (path, timestamp) => seenFiles.isNewFile(path, timestamp)
       }
     }
@@ -180,7 +197,7 @@ class FileStreamSource(
       metadataLogCurrentOffset += 1
 
       val fileEntries = batchFiles.map { case (p, timestamp) =>
-        FileEntry(path = p, timestamp = timestamp, batchId = metadataLogCurrentOffset)
+        FileEntry(path = p.urlEncoded, timestamp = timestamp, batchId = metadataLogCurrentOffset)
       }.toArray
       if (metadataLog.add(metadataLogCurrentOffset, fileEntries)) {
         logInfo(s"Log offset set to $metadataLogCurrentOffset with ${batchFiles.size} new files")
@@ -191,6 +208,10 @@ class FileStreamSource(
     }
 
     FileStreamSourceOffset(metadataLogCurrentOffset)
+  }
+
+  override def prepareForTriggerAvailableNow(): Unit = {
+    allFilesForTriggerAvailableNow = fetchAllFiles()
   }
 
   override def getDefaultReadLimit: ReadLimit = {
@@ -222,11 +243,11 @@ class FileStreamSource(
     val newDataSource =
       DataSource(
         sparkSession,
-        paths = files.map(f => new Path(new URI(f.path)).toString),
+        paths = files.map(_.sparkPath.toPath.toString).toImmutableArraySeq,
         userSpecifiedSchema = Some(schema),
         partitionColumns = partitionColumns,
         className = fileFormatClassName,
-        options = optionsWithPartitionBasePath)
+        options = optionsForInnerDataSource)
     Dataset.ofRows(sparkSession, LogicalRelation(newDataSource.resolveRelation(
       checkFilesExist = false), isStreaming = true))
   }
@@ -259,8 +280,7 @@ class FileStreamSource(
   private def setSourceHasMetadata(newValue: Option[Boolean]): Unit = newValue match {
     case Some(true) =>
       if (sourceCleaner.isDefined) {
-        throw new UnsupportedOperationException("Clean up source files is not supported when" +
-          " reading from the output directory of FileStreamSink.")
+        throw QueryExecutionErrors.cleanUpSourceFilesUnsupportedError()
       }
       sourceHasMetadata = Some(true)
     case _ =>
@@ -270,7 +290,7 @@ class FileStreamSource(
   /**
    * Returns a list of files found, sorted by their timestamp.
    */
-  private def fetchAllFiles(): Seq[(String, Long)] = {
+  private def fetchAllFiles(): Seq[(SparkPath, Long)] = {
     val startTime = System.nanoTime
 
     var allFiles: Seq[FileStatus] = null
@@ -302,7 +322,7 @@ class FileStreamSource(
     }
 
     val files = allFiles.sortBy(_.getModificationTime)(fileSortOrder).map { status =>
-      (status.getPath.toUri.toString, status.getModificationTime)
+      (SparkPath.fromFileStatus(status), status.getModificationTime)
     }
     val endTime = System.nanoTime
     val listingTimeMs = NANOSECONDS.toMillis(endTime - startTime)
@@ -317,8 +337,7 @@ class FileStreamSource(
   }
 
   override def getOffset: Option[Offset] = {
-    throw new UnsupportedOperationException(
-      "latestOffset(Offset, ReadLimit) should be called instead of this method")
+    throw QueryExecutionErrors.latestOffsetNotCalledError()
   }
 
   override def latestOffset(startOffset: streaming.Offset, limit: ReadLimit): streaming.Offset = {
@@ -353,7 +372,12 @@ object FileStreamSource {
   val DISCARD_UNSEEN_FILES_RATIO = 0.2
   val MAX_CACHED_UNSEEN_FILES = 10000
 
-  case class FileEntry(path: String, timestamp: Timestamp, batchId: Long) extends Serializable
+  case class FileEntry(
+      path: String, // uri-encoded path string
+      timestamp: Timestamp,
+      batchId: Long) extends Serializable {
+    def sparkPath: SparkPath = SparkPath.fromUrlString(path)
+  }
 
   /**
    * A custom hash map used to track the list of files seen. This map is not thread-safe.
@@ -373,12 +397,12 @@ object FileStreamSource {
     /** Timestamp for the last purge operation. */
     private var lastPurgeTimestamp: Timestamp = 0L
 
-    @inline private def stripPathIfNecessary(path: String) = {
-      if (fileNameOnly) new Path(new URI(path)).getName else path
+    @inline private def stripPathIfNecessary(path: SparkPath) = {
+      if (fileNameOnly) path.toPath.getName else path.urlEncoded
     }
 
     /** Add a new file to the map. */
-    def add(path: String, timestamp: Timestamp): Unit = {
+    def add(path: SparkPath, timestamp: Timestamp): Unit = {
       map.put(stripPathIfNecessary(path), timestamp)
       if (timestamp > latestTimestamp) {
         latestTimestamp = timestamp
@@ -389,7 +413,7 @@ object FileStreamSource {
      * Returns true if we should consider this file a new file. The file is only considered "new"
      * if it is new enough that we are still tracking, and we have not seen it before.
      */
-    def isNewFile(path: String, timestamp: Timestamp): Boolean = {
+    def isNewFile(path: SparkPath, timestamp: Timestamp): Boolean = {
       // Note that we are testing against lastPurgeTimestamp here so we'd never miss a file that
       // is older than (latestTimestamp - maxAgeMs) but has not been purged yet.
       timestamp >= lastPurgeTimestamp && !map.containsKey(stripPathIfNecessary(path))
@@ -536,7 +560,7 @@ object FileStreamSource {
     }
 
     override protected def cleanTask(entry: FileEntry): Unit = {
-      val curPath = new Path(new URI(entry.path))
+      val curPath = entry.sparkPath.toPath
       val newPath = new Path(baseArchivePath.toString.stripSuffix("/") + curPath.toUri.getPath)
 
       try {
@@ -560,7 +584,7 @@ object FileStreamSource {
     extends FileStreamSourceCleaner with Logging {
 
     override protected def cleanTask(entry: FileEntry): Unit = {
-      val curPath = new Path(new URI(entry.path))
+      val curPath = entry.sparkPath.toPath
       try {
         logDebug(s"Removing completed file $curPath")
 

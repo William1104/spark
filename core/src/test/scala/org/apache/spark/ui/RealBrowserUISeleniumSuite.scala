@@ -18,7 +18,6 @@
 package org.apache.spark.ui
 
 import org.openqa.selenium.{By, JavascriptExecutor, WebDriver}
-import org.scalatest.BeforeAndAfterAll
 import org.scalatest.concurrent.Eventually._
 import org.scalatest.matchers.must.Matchers
 import org.scalatest.matchers.should.Matchers._
@@ -35,7 +34,7 @@ import org.apache.spark.util.CallSite
  * Selenium tests for the Spark Web UI with real web browsers.
  */
 abstract class RealBrowserUISeleniumSuite(val driverProp: String)
-  extends SparkFunSuite with WebBrowser with Matchers with BeforeAndAfterAll {
+  extends SparkFunSuite with WebBrowser with Matchers {
 
   implicit var webDriver: WebDriver with JavascriptExecutor
   private val driverPropPrefix = "spark.test."
@@ -58,7 +57,7 @@ abstract class RealBrowserUISeleniumSuite(val driverProp: String)
     withSpark(newSparkContext()) { sc =>
       sc.setLocalProperty(CallSite.LONG_FORM, "collect at <console>:25")
       sc.setLocalProperty(CallSite.SHORT_FORM, "collect at <console>:25")
-      sc.parallelize(1 to 10).collect
+      sc.parallelize(1 to 10).collect()
 
       eventually(timeout(10.seconds), interval(50.milliseconds)) {
         goToUi(sc, "/jobs")
@@ -82,7 +81,7 @@ abstract class RealBrowserUISeleniumSuite(val driverProp: String)
 
   test("SPARK-31882: Link URL for Stage DAGs should not depend on paged table.") {
     withSpark(newSparkContext()) { sc =>
-      sc.parallelize(1 to 100).map(v => (v, v)).repartition(10).reduceByKey(_ + _).collect
+      sc.parallelize(1 to 100).map(v => (v, v)).repartition(10).reduceByKey(_ + _).collect()
 
       eventually(timeout(10.seconds), interval(50.microseconds)) {
         val pathWithPagedTable =
@@ -104,7 +103,7 @@ abstract class RealBrowserUISeleniumSuite(val driverProp: String)
 
   test("SPARK-31886: Color barrier execution mode RDD correctly") {
     withSpark(newSparkContext()) { sc =>
-      sc.parallelize(1 to 10).barrier.mapPartitions(identity).repartition(1).collect()
+      sc.parallelize(1 to 10).barrier().mapPartitions(identity).repartition(1).collect()
 
       eventually(timeout(10.seconds), interval(50.milliseconds)) {
         goToUi(sc, "/jobs/job/?id=0")
@@ -132,7 +131,7 @@ abstract class RealBrowserUISeleniumSuite(val driverProp: String)
 
   test("Search text for paged tables should not be saved") {
     withSpark(newSparkContext()) { sc =>
-      sc.parallelize(1 to 10).collect
+      sc.parallelize(1 to 10).collect()
 
       eventually(timeout(10.seconds), interval(1.seconds)) {
         val taskSearchBox = "$(\"input[aria-controls='active-tasks-table']\")"

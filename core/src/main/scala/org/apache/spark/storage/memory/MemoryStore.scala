@@ -23,11 +23,13 @@ import java.util.LinkedHashMap
 
 import scala.collection.mutable
 import scala.collection.mutable.ArrayBuffer
+import scala.jdk.CollectionConverters._
 import scala.reflect.ClassTag
+import scala.util.control.NonFatal
 
 import com.google.common.io.ByteStreams
 
-import org.apache.spark.{SparkConf, TaskContext}
+import org.apache.spark.{SparkConf, SparkException, TaskContext}
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.{STORAGE_UNROLL_MEMORY_THRESHOLD, UNROLL_MEMORY_CHECK_PERIOD, UNROLL_MEMORY_GROWTH_FACTOR}
 import org.apache.spark.memory.{MemoryManager, MemoryMode}
@@ -47,8 +49,8 @@ private sealed trait MemoryEntry[T] {
 private case class DeserializedMemoryEntry[T](
     value: Array[T],
     size: Long,
+    memoryMode: MemoryMode,
     classTag: ClassTag[T]) extends MemoryEntry[T] {
-  val memoryMode: MemoryMode = MemoryMode.ON_HEAP
 }
 private case class SerializedMemoryEntry[T](
     buffer: ChunkedByteBuffer,
@@ -217,8 +219,13 @@ private[spark] class MemoryStore(
       unrollMemoryUsedByThisBlock += initialMemoryThreshold
     }
 
+    // Only do the thread interruption check on the executors.
+    val shouldCheckThreadInterruption = Option(TaskContext.get()).isDefined
+
     // Unroll this block safely, checking whether we have exceeded our threshold periodically
-    while (values.hasNext && keepUnrolling) {
+    // and if no thread interrupts have been received.
+    while (values.hasNext && keepUnrolling &&
+      (!shouldCheckThreadInterruption || !Thread.currentThread().isInterrupted)) {
       valuesHolder.storeValue(values.next())
       if (elementsUnrolled % memoryCheckPeriod == 0) {
         val currentSize = valuesHolder.estimatedSize()
@@ -237,10 +244,15 @@ private[spark] class MemoryStore(
       elementsUnrolled += 1
     }
 
-    // Make sure that we have enough memory to store the block. By this point, it is possible that
-    // the block's actual memory usage has exceeded the unroll memory by a small amount, so we
-    // perform one final call to attempt to allocate additional memory if necessary.
-    if (keepUnrolling) {
+    // SPARK-45025 - if a thread interrupt was received, we log a warning and return used memory
+    // to avoid getting killed by task reaper eventually.
+    if (shouldCheckThreadInterruption && Thread.currentThread().isInterrupted) {
+      logInfo(s"Failed to unroll block=$blockId since thread interrupt was received")
+      Left(unrollMemoryUsedByThisBlock)
+    } else if (keepUnrolling) {
+      // Make sure that we have enough memory to store the block. By this point, it is possible that
+      // the block's actual memory usage has exceeded the unroll memory by a small amount, so we
+      // perform one final call to attempt to allocate additional memory if necessary.
       val entryBuilder = valuesHolder.getBuilder()
       val size = entryBuilder.preciseSize
       if (size > unrollMemoryUsedByThisBlock) {
@@ -292,22 +304,23 @@ private[spark] class MemoryStore(
   private[storage] def putIteratorAsValues[T](
       blockId: BlockId,
       values: Iterator[T],
+      memoryMode: MemoryMode,
       classTag: ClassTag[T]): Either[PartiallyUnrolledIterator[T], Long] = {
 
-    val valuesHolder = new DeserializedValuesHolder[T](classTag)
+    val valuesHolder = new DeserializedValuesHolder[T](classTag, memoryMode)
 
-    putIterator(blockId, values, classTag, MemoryMode.ON_HEAP, valuesHolder) match {
+    putIterator(blockId, values, classTag, memoryMode, valuesHolder) match {
       case Right(storedSize) => Right(storedSize)
       case Left(unrollMemoryUsedByThisBlock) =>
         val unrolledIterator = if (valuesHolder.vector != null) {
           valuesHolder.vector.iterator
         } else {
-          valuesHolder.arrayValues.toIterator
+          valuesHolder.arrayValues.iterator
         }
 
         Left(new PartiallyUnrolledIterator(
           this,
-          MemoryMode.ON_HEAP,
+          memoryMode,
           unrollMemoryUsedByThisBlock,
           unrolled = unrolledIterator,
           rest = values))
@@ -346,7 +359,7 @@ private[spark] class MemoryStore(
     val valuesHolder = new SerializedValuesHolder[T](blockId, chunkSize, classTag,
       memoryMode, serializerManager)
 
-    putIterator(blockId, values, classTag, memoryMode, valuesHolder) match {
+    val res = putIterator(blockId, values, classTag, memoryMode, valuesHolder) match {
       case Right(storedSize) => Right(storedSize)
       case Left(unrollMemoryUsedByThisBlock) =>
         Left(new PartiallySerializedBlock(
@@ -361,14 +374,18 @@ private[spark] class MemoryStore(
           values,
           classTag))
     }
+
+    Option(TaskContext.get()).foreach(_.killTaskIfInterrupted())
+    res
   }
 
   def getBytes(blockId: BlockId): Option[ChunkedByteBuffer] = {
     val entry = entries.synchronized { entries.get(blockId) }
     entry match {
       case null => None
-      case e: DeserializedMemoryEntry[_] =>
-        throw new IllegalArgumentException("should only call getBytes on serialized blocks")
+      case _: DeserializedMemoryEntry[_] =>
+        throw SparkException.internalError(
+          "should only call getBytes on serialized blocks", category = "STORAGE")
       case SerializedMemoryEntry(bytes, _, _) => Some(bytes)
     }
   }
@@ -378,10 +395,27 @@ private[spark] class MemoryStore(
     entry match {
       case null => None
       case e: SerializedMemoryEntry[_] =>
-        throw new IllegalArgumentException("should only call getValues on deserialized blocks")
-      case DeserializedMemoryEntry(values, _, _) =>
+        throw SparkException.internalError(
+          "should only call getValues on deserialized blocks", category = "STORAGE")
+      case DeserializedMemoryEntry(values, _, _, _) =>
         val x = Some(values)
         x.map(_.iterator)
+    }
+  }
+
+  def freeMemoryEntry[T <: MemoryEntry[_]](entry: T): Unit = {
+    entry match {
+      case SerializedMemoryEntry(buffer, _, _) => buffer.dispose()
+      case e: DeserializedMemoryEntry[_] => e.value.foreach {
+        case o: AutoCloseable =>
+          try {
+            o.close()
+          } catch {
+            case NonFatal(e) =>
+              logWarning("Fail to close a memory entry", e)
+          }
+        case _ =>
+      }
     }
   }
 
@@ -390,10 +424,7 @@ private[spark] class MemoryStore(
       entries.remove(blockId)
     }
     if (entry != null) {
-      entry match {
-        case SerializedMemoryEntry(buffer, _, _) => buffer.dispose()
-        case _ =>
-      }
+      freeMemoryEntry(entry)
       memoryManager.releaseStorageMemory(entry.size, entry.memoryMode)
       logDebug(s"Block $blockId of size ${entry.size} dropped " +
         s"from memory (free ${maxMemory - blocksMemoryUsed})")
@@ -405,6 +436,7 @@ private[spark] class MemoryStore(
 
   def clear(): Unit = memoryManager.synchronized {
     entries.synchronized {
+      entries.values.asScala.foreach(freeMemoryEntry)
       entries.clear()
     }
     onHeapUnrollMemoryMap.clear()
@@ -458,7 +490,7 @@ private[spark] class MemoryStore(
             // non-blocking "tryLock" here in order to ignore blocks which are locked for reading:
             if (blockInfoManager.lockForWriting(blockId, blocking = false).isDefined) {
               selectedBlocks += blockId
-              freedMemory += pair.getValue.size
+              freedMemory += entry.size
             }
           }
         }
@@ -466,7 +498,7 @@ private[spark] class MemoryStore(
 
       def dropBlock[T](blockId: BlockId, entry: MemoryEntry[T]): Unit = {
         val data = entry match {
-          case DeserializedMemoryEntry(values, _, _) => Left(values)
+          case DeserializedMemoryEntry(values, _, _, _) => Left(values)
           case SerializedMemoryEntry(buffer, _, _) => Right(buffer)
         }
         val newEffectiveStorageLevel =
@@ -487,7 +519,7 @@ private[spark] class MemoryStore(
         try {
           logInfo(s"${selectedBlocks.size} blocks selected for dropping " +
             s"(${Utils.bytesToString(freedMemory)} bytes)")
-          (0 until selectedBlocks.size).foreach { idx =>
+          selectedBlocks.indices.foreach { idx =>
             val blockId = selectedBlocks(idx)
             val entry = entries.synchronized {
               entries.get(blockId)
@@ -656,7 +688,9 @@ private trait ValuesHolder[T] {
 /**
  * A holder for storing the deserialized values.
  */
-private class DeserializedValuesHolder[T] (classTag: ClassTag[T]) extends ValuesHolder[T] {
+private class DeserializedValuesHolder[T](
+    classTag: ClassTag[T],
+    memoryMode: MemoryMode) extends ValuesHolder[T] {
   // Underlying vector for unrolling the block
   var vector = new SizeTrackingVector[T]()(classTag)
   var arrayValues: Array[T] = null
@@ -677,7 +711,7 @@ private class DeserializedValuesHolder[T] (classTag: ClassTag[T]) extends Values
     override val preciseSize: Long = SizeEstimator.estimate(arrayValues)
 
     override def build(): MemoryEntry[T] =
-      DeserializedMemoryEntry[T](arrayValues, preciseSize, classTag)
+      DeserializedMemoryEntry[T](arrayValues, preciseSize, memoryMode, classTag)
   }
 }
 
@@ -716,7 +750,7 @@ private class SerializedValuesHolder[T](
     // We successfully unrolled the entirety of this block
     serializationStream.close()
 
-    override def preciseSize(): Long = bbos.size
+    override def preciseSize: Long = bbos.size
 
     override def build(): MemoryEntry[T] =
       SerializedMemoryEntry[T](bbos.toChunkedByteBuffer, memoryMode, classTag)
@@ -843,11 +877,13 @@ private[storage] class PartiallySerializedBlock[T](
 
   private def verifyNotConsumedAndNotDiscarded(): Unit = {
     if (consumed) {
-      throw new IllegalStateException(
-        "Can only call one of finishWritingToStream() or valuesIterator() and can only call once.")
+      throw SparkException.internalError(
+        "Can only call one of finishWritingToStream() or valuesIterator() and can only call once.",
+        category = "STORAGE")
     }
     if (discarded) {
-      throw new IllegalStateException("Cannot call methods on a discarded PartiallySerializedBlock")
+      throw SparkException.internalError(
+        "Cannot call methods on a discarded PartiallySerializedBlock", category = "STORAGE")
     }
   }
 

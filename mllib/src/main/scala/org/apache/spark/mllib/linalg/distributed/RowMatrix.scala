@@ -91,19 +91,34 @@ class RowMatrix @Since("1.0.0") (
   private[mllib] def multiplyGramianMatrixBy(v: BDV[Double]): BDV[Double] = {
     val n = numCols().toInt
     val vbr = rows.context.broadcast(v)
-    rows.treeAggregate(BDV.zeros[Double](n))(
+    rows.treeAggregate(null.asInstanceOf[BDV[Double]])(
       seqOp = (U, r) => {
         val rBrz = r.asBreeze
         val a = rBrz.dot(vbr.value)
+        val theU =
+          if (U == null) {
+            BDV.zeros[Double](n)
+          } else {
+            U
+          }
         rBrz match {
           // use specialized axpy for better performance
-          case _: BDV[_] => brzAxpy(a, rBrz.asInstanceOf[BDV[Double]], U)
-          case _: BSV[_] => brzAxpy(a, rBrz.asInstanceOf[BSV[Double]], U)
+          case _: BDV[_] => brzAxpy(a, rBrz.asInstanceOf[BDV[Double]], theU)
+          case _: BSV[_] => brzAxpy(a, rBrz.asInstanceOf[BSV[Double]], theU)
           case _ => throw new UnsupportedOperationException(
             s"Do not support vector operation from type ${rBrz.getClass.getName}.")
         }
-        U
-      }, combOp = (U1, U2) => U1 += U2)
+        theU
+      }, combOp = (U1, U2) => {
+        if (U1 == null) {
+          U2
+        } else if (U2 == null) {
+          U1
+        } else {
+          U1 += U2
+          U1
+        }
+      })
   }
 
   /**
@@ -421,6 +436,11 @@ class RowMatrix @Since("1.0.0") (
     }
   }
 
+  // The matrix is sparse, if all the rows has sparsity more than 0.5.
+  private def isSparseMatrix: Boolean = {
+    rows.filter(row => row.sparsity() < 0.5).isEmpty()
+  }
+
   /**
    * Computes the covariance matrix, treating each row as an observation.
    *
@@ -438,8 +458,8 @@ class RowMatrix @Since("1.0.0") (
     require(m > 1, s"RowMatrix.computeCovariance called on matrix with only $m rows." +
       "  Cannot compute the covariance of a RowMatrix with <= 1 row.")
     val mean = Vectors.fromML(summary.mean)
-
-    if (rows.first().isInstanceOf[DenseVector]) {
+    // If all the rows are sparse vectors, then compute based on `computeSparseVectorCovariance`.
+    if (!isSparseMatrix) {
       computeDenseVectorCovariance(mean, n, m)
     } else {
       computeSparseVectorCovariance(mean, n, m)
@@ -613,7 +633,7 @@ class RowMatrix @Since("1.0.0") (
     val gamma = if (threshold < 1e-6) {
       Double.PositiveInfinity
     } else {
-      10 * math.log(numCols()) / threshold
+      10 * math.log(numCols().toDouble) / threshold
     }
 
     val summary = Statistics.colStats(rows.map((_, 1.0)), Seq("normL2"))
@@ -683,7 +703,7 @@ class RowMatrix @Since("1.0.0") (
       colMags: Array[Double],
       gamma: Double): CoordinateMatrix = {
     require(gamma > 1.0, s"Oversampling should be greater than 1: $gamma")
-    require(colMags.size == this.numCols(), "Number of magnitudes didn't match column dimension")
+    require(colMags.length == this.numCols(), "Number of magnitudes didn't match column dimension")
     val sg = math.sqrt(gamma) // sqrt(gamma) used many times
 
     // Don't divide by zero for those columns with zero magnitude
@@ -698,11 +718,11 @@ class RowMatrix @Since("1.0.0") (
       val q = qBV.value
 
       val rand = new XORShiftRandom(index)
-      val scaled = new Array[Double](p.size)
+      val scaled = new Array[Double](p.length)
       iter.flatMap { row =>
         row match {
           case SparseVector(size, indices, values) =>
-            val nnz = indices.size
+            val nnz = indices.length
             var k = 0
             while (k < nnz) {
               scaled(k) = values(k) / q(indices(k))
@@ -727,7 +747,7 @@ class RowMatrix @Since("1.0.0") (
               buf
             }.flatten
           case DenseVector(values) =>
-            val n = values.size
+            val n = values.length
             var i = 0
             while (i < n) {
               scaled(i) = values(i) / q(i)
@@ -803,7 +823,8 @@ class RowMatrix @Since("1.0.0") (
         + s"as it's bigger than maxResultSize ($maxDriverResultSizeInBytes Bytes)")
 
     val numerator = math.log(rows.getNumPartitions)
-    val denominator = math.log(maxDriverResultSizeInBytes) - math.log(aggregatedObjectSizeInBytes)
+    val denominator = math.log(maxDriverResultSizeInBytes.toDouble) -
+      math.log(aggregatedObjectSizeInBytes.toDouble)
     val desiredTreeDepth = math.ceil(numerator / denominator)
 
     if (desiredTreeDepth > 4) {

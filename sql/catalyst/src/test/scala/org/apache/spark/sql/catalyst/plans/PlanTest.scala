@@ -23,7 +23,7 @@ import org.scalatest.Tag
 
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.catalyst.SQLConfHelper
-import org.apache.spark.sql.catalyst.analysis.SimpleAnalyzer
+import org.apache.spark.sql.catalyst.analysis.{GetViewColumnByNameAndOrdinal, SimpleAnalyzer}
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.expressions.CodegenObjectFactoryMode
 import org.apache.spark.sql.catalyst.expressions.aggregate.AggregateExpression
@@ -73,20 +73,30 @@ trait PlanTestBase extends PredicateHelper with SQLHelper with SQLConfHelper { s
     plan transformAllExpressions {
       case s: ScalarSubquery =>
         s.copy(plan = normalizeExprIds(s.plan), exprId = ExprId(0))
+      case s: LateralSubquery =>
+        s.copy(plan = normalizeExprIds(s.plan), exprId = ExprId(0))
       case e: Exists =>
-        e.copy(exprId = ExprId(0))
+        e.copy(plan = normalizeExprIds(e.plan), exprId = ExprId(0))
       case l: ListQuery =>
-        l.copy(exprId = ExprId(0))
+        l.copy(plan = normalizeExprIds(l.plan), exprId = ExprId(0))
       case a: AttributeReference =>
         AttributeReference(a.name, a.dataType, a.nullable)(exprId = ExprId(0))
+      case OuterReference(a: AttributeReference) =>
+        OuterReference(AttributeReference(a.name, a.dataType, a.nullable)(exprId = ExprId(0)))
       case a: Alias =>
         Alias(a.child, a.name)(exprId = ExprId(0))
+      case OuterReference(a: Alias) =>
+        OuterReference(Alias(a.child, a.name)(exprId = ExprId(0)))
       case ae: AggregateExpression =>
         ae.copy(resultId = ExprId(0))
       case lv: NamedLambdaVariable =>
         lv.copy(exprId = ExprId(0), value = null)
       case udf: PythonUDF =>
         udf.copy(resultId = ExprId(0))
+      case udaf: PythonUDAF =>
+        udaf.copy(resultId = ExprId(0))
+      case a: FunctionTableSubqueryArgumentExpression =>
+        a.copy(plan = normalizeExprIds(a.plan), exprId = ExprId(0))
     }
   }
 
@@ -124,6 +134,14 @@ trait PlanTestBase extends PredicateHelper with SQLHelper with SQLConfHelper { s
           splitConjunctivePredicates(condition.get).map(rewriteBinaryComparison)
             .sortBy(_.hashCode()).reduce(And)
         Join(left, right, newJoinType, Some(newCondition), hint)
+      case Project(projectList, child) =>
+        val projList = projectList.map { e =>
+          e.transformUp {
+            case g: GetViewColumnByNameAndOrdinal => g.copy(viewDDL = None)
+          }
+        }.asInstanceOf[Seq[NamedExpression]]
+        Project(projList, child)
+      case c: KeepAnalyzedQuery => c.storeAnalyzedQuery()
     }
   }
 

@@ -9,9 +9,9 @@ license: |
   The ASF licenses this file to You under the Apache License, Version 2.0
   (the "License"); you may not use this file except in compliance with
   the License.  You may obtain a copy of the License at
- 
+
      http://www.apache.org/licenses/LICENSE-2.0
- 
+
   Unless required by applicable law or agreed to in writing, software
   distributed under the License is distributed on an "AS IS" BASIS,
   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -35,8 +35,9 @@ For example, historically, `native` implementation handles `CHAR/VARCHAR` with S
 
 ### Vectorized Reader
 
-`native` implementation supports a vectorized ORC reader and has been the default ORC implementaion since Spark 2.3.
+`native` implementation supports a vectorized ORC reader and has been the default ORC implementation since Spark 2.3.
 The vectorized reader is used for the native ORC tables (e.g., the ones created using the clause `USING ORC`) when `spark.sql.orc.impl` is set to `native` and `spark.sql.orc.enableVectorizedReader` is set to `true`.
+
 For the Hive ORC serde tables (e.g., the ones created using the clause `USING HIVE OPTIONS (fileFormat 'ORC')`),
 the vectorized reader is used when `spark.sql.hive.convertMetastoreOrc` is also set to `true`, and is turned on by default.
 
@@ -55,8 +56,7 @@ turned it off by default . You may enable it by
 
 ### Zstandard
 
-Spark supports both Hadoop 2 and 3. Since Spark 3.2, you can take advantage
-of Zstandard compression in ORC files on both Hadoop versions.
+Since Spark 3.2, you can take advantage of Zstandard compression in ORC files.
 Please see [Zstandard](https://facebook.github.io/zstd/) for the benefits.
 
 <div class="codetabs">
@@ -129,8 +129,8 @@ When reading from Hive metastore ORC tables and inserting to Hive metastore ORC 
 
 ### Configuration
 
-<table class="table">
-  <tr><th><b>Property Name</b></th><th><b>Default</b></th><th><b>Meaning</b></th><th><b>Since Version</b></th></tr>
+<table class="spark-config">
+  <thead><tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr></thead>
   <tr>
     <td><code>spark.sql.orc.impl</code></td>
     <td><code>native</code></td>
@@ -150,6 +150,53 @@ When reading from Hive metastore ORC tables and inserting to Hive metastore ORC 
       For <code>hive</code> implementation, this is ignored.
     </td>
     <td>2.3.0</td>
+  </tr>
+  <tr>
+    <td><code>spark.sql.orc.columnarReaderBatchSize</code></td>
+    <td><code>4096</code></td>
+    <td>
+      The number of rows to include in an orc vectorized reader batch. The number should
+      be carefully chosen to minimize overhead and avoid OOMs in reading data.
+    </td>
+    <td>2.4.0</td>
+  </tr>
+  <tr>
+    <td><code>spark.sql.orc.columnarWriterBatchSize</code></td>
+    <td><code>1024</code></td>
+    <td>
+      The number of rows to include in an orc vectorized writer batch. The number should
+      be carefully chosen to minimize overhead and avoid OOMs in writing data.
+    </td>
+    <td>3.4.0</td>
+  </tr>
+  <tr>
+    <td><code>spark.sql.orc.enableNestedColumnVectorizedReader</code></td>
+    <td><code>true</code></td>
+    <td>
+      Enables vectorized orc decoding in <code>native</code> implementation for nested data types
+      (array, map and struct). If <code>spark.sql.orc.enableVectorizedReader</code> is set to
+      <code>false</code>, this is ignored.
+    </td>
+    <td>3.2.0</td>
+  </tr>
+  <tr>
+    <td><code>spark.sql.orc.filterPushdown</code></td>
+    <td><code>true</code></td>
+    <td>
+      When true, enable filter pushdown for ORC files.
+    </td>
+    <td>1.4.0</td>
+  </tr>
+  <tr>
+    <td><code>spark.sql.orc.aggregatePushdown</code></td>
+    <td><code>false</code></td>
+    <td>
+      If true, aggregates will be pushed down to ORC for optimization. Support MIN, MAX and
+      COUNT as aggregate expression. For MIN/MAX, support boolean, integer, float and date
+      type. For COUNT, support all data types. If statistics is missing from any ORC file
+      footer, exception would be thrown.
+    </td>
+    <td>3.3.0</td>
   </tr>
   <tr>
   <td><code>spark.sql.orc.mergeSchema</code></td>
@@ -172,3 +219,30 @@ When reading from Hive metastore ORC tables and inserting to Hive metastore ORC 
   <td>2.0.0</td>
   </tr>
 </table>
+
+## Data Source Option
+
+Data source options of ORC can be set via:
+* the `.option`/`.options` methods of
+  * `DataFrameReader`
+  * `DataFrameWriter`
+  * `DataStreamReader`
+  * `DataStreamWriter`
+* `OPTIONS` clause at [CREATE TABLE USING DATA_SOURCE](sql-ref-syntax-ddl-create-table-datasource.html)
+
+<table>
+  <thead><tr><th><b>Property Name</b></th><th><b>Default</b></th><th><b>Meaning</b></th><th><b>Scope</b></th></tr></thead>
+  <tr>
+    <td><code>mergeSchema</code></td>
+    <td><code>false</code></td>
+    <td>sets whether we should merge schemas collected from all ORC part-files. This will override <code>spark.sql.orc.mergeSchema</code>. The default value is specified in <code>spark.sql.orc.mergeSchema</code>.</td>
+    <td>read</td>
+  </tr>
+  <tr>
+    <td><code>compression</code></td>
+    <td><code>zstd</code></td>
+    <td>compression codec to use when saving to file. This can be one of the known case-insensitive shorten names (none, snappy, zlib, lzo, zstd and lz4). This will override <code>orc.compress</code> and <code>spark.sql.orc.compression.codec</code>.</td>
+    <td>write</td>
+  </tr>
+</table>
+Other generic options can be found in <a href="https://spark.apache.org/docs/latest/sql-data-sources-generic-options.html"> Generic File Source Options</a>.

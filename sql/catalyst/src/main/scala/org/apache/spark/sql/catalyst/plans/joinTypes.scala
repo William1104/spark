@@ -19,6 +19,7 @@ package org.apache.spark.sql.catalyst.plans
 
 import java.util.Locale
 
+import org.apache.spark.SparkUnsupportedOperationException
 import org.apache.spark.sql.catalyst.expressions.Attribute
 
 object JoinType {
@@ -91,7 +92,7 @@ case class ExistenceJoin(exists: Attribute) extends JoinType {
   override def sql: String = {
     // This join type is only used in the end of optimizer and physical plans, we will not
     // generate SQL for this join type
-    throw new UnsupportedOperationException
+    throw SparkUnsupportedOperationException()
   }
 }
 
@@ -105,6 +106,7 @@ case class UsingJoin(tpe: JoinType, usingColumns: Seq[String]) extends JoinType 
   require(Seq(Inner, LeftOuter, LeftSemi, RightOuter, FullOuter, LeftAnti, Cross).contains(tpe),
     "Unsupported using join type " + tpe)
   override def sql: String = "USING " + tpe.sql
+  override def toString: String = s"UsingJoin($tpe, ${usingColumns.mkString("[", ", ", "]")})"
 }
 
 object LeftExistence {
@@ -121,3 +123,24 @@ object LeftSemiOrAnti {
     case _ => None
   }
 }
+
+object AsOfJoinDirection {
+
+  def apply(direction: String): AsOfJoinDirection = {
+    direction.toLowerCase(Locale.ROOT) match {
+      case "forward" => Forward
+      case "backward" => Backward
+      case "nearest" => Nearest
+      case _ =>
+        val supported = Seq("forward", "backward", "nearest")
+        throw new IllegalArgumentException(s"Unsupported as-of join direction '$direction'. " +
+          "Supported as-of join direction include: " + supported.mkString("'", "', '", "'") + ".")
+    }
+  }
+}
+
+sealed abstract class AsOfJoinDirection
+
+case object Forward extends AsOfJoinDirection
+case object Backward extends AsOfJoinDirection
+case object Nearest extends AsOfJoinDirection

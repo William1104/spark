@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -55,7 +54,7 @@ public class HiveSessionImplwithUGI extends HiveSessionImpl {
     // create a new metastore connection for this particular user session
     Hive.set(null);
     try {
-      sessionHive = Hive.get(getHiveConf());
+      sessionHive = Hive.getWithoutRegisterFns(getHiveConf());
     } catch (HiveException e) {
       throw new HiveSQLException("Failed to setup metastore connection", e);
     }
@@ -141,7 +140,7 @@ public class HiveSessionImplwithUGI extends HiveSessionImpl {
   private void cancelDelegationToken() throws HiveSQLException {
     if (delegationTokenStr != null) {
       try {
-        Hive.get(getHiveConf()).cancelDelegationToken(delegationTokenStr);
+        Hive.getWithoutRegisterFns(getHiveConf()).cancelDelegationToken(delegationTokenStr);
       } catch (HiveException e) {
         throw new HiveSQLException("Couldn't cancel delegation token", e);
       }

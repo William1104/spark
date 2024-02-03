@@ -196,6 +196,7 @@ Functions
 
     array_to_vector
     vector_to_array
+    predict_batch_udf
 
 
 Vector and Matrix
@@ -288,7 +289,6 @@ Tuning
     :toctree: api/
 
     ParamGridBuilder
-    ParamRandomBuilder
     CrossValidator
     CrossValidatorModel
     TrainValidationSplit
@@ -338,6 +338,26 @@ Image
 
     ImageSchema
     _ImageSchema
+
+
+Distributor
+-----------
+
+
+.. currentmodule:: pyspark.ml.torch.distributor
+
+.. autosummary::
+    :template: autosummary/class_with_docs.rst
+    :toctree: api/
+
+    TorchDistributor
+
+.. currentmodule:: pyspark.ml.deepspeed.deepspeed_distributor
+.. autosummary::
+    :template: autosummary/class_with_docs.rst
+    :toctree: api/
+
+    DeepspeedTorchDistributor
 
 
 Utilities

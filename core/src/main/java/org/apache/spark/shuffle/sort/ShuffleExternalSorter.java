@@ -21,7 +21,9 @@ import javax.annotation.Nullable;
 import java.io.File;
 import java.io.IOException;
 import java.util.LinkedList;
+import java.util.zip.Checksum;
 
+import org.apache.spark.SparkException;
 import scala.Tuple2;
 
 import com.google.common.annotations.VisibleForTesting;
@@ -39,6 +41,7 @@ import org.apache.spark.memory.TooLargePageException;
 import org.apache.spark.serializer.DummySerializerInstance;
 import org.apache.spark.serializer.SerializerInstance;
 import org.apache.spark.shuffle.ShuffleWriteMetricsReporter;
+import org.apache.spark.shuffle.checksum.ShuffleChecksumSupport;
 import org.apache.spark.storage.BlockManager;
 import org.apache.spark.storage.DiskBlockObjectWriter;
 import org.apache.spark.storage.FileSegment;
@@ -65,7 +68,7 @@ import org.apache.spark.util.Utils;
  * spill files. Instead, this merging is performed in {@link UnsafeShuffleWriter}, which uses a
  * specialized merge procedure that avoids extra serialization/deserialization.
  */
-final class ShuffleExternalSorter extends MemoryConsumer {
+final class ShuffleExternalSorter extends MemoryConsumer implements ShuffleChecksumSupport {
 
   private static final Logger logger = LoggerFactory.getLogger(ShuffleExternalSorter.class);
 
@@ -107,6 +110,9 @@ final class ShuffleExternalSorter extends MemoryConsumer {
   @Nullable private MemoryBlock currentPage = null;
   private long pageCursor = -1;
 
+  // Checksum calculator for each partition. Empty when shuffle checksum disabled.
+  private final Checksum[] partitionChecksums;
+
   ShuffleExternalSorter(
       TaskMemoryManager memoryManager,
       BlockManager blockManager,
@@ -114,7 +120,7 @@ final class ShuffleExternalSorter extends MemoryConsumer {
       int initialSize,
       int numPartitions,
       SparkConf conf,
-      ShuffleWriteMetricsReporter writeMetrics) {
+      ShuffleWriteMetricsReporter writeMetrics) throws SparkException {
     super(memoryManager,
       (int) Math.min(PackedRecordPointer.MAXIMUM_PAGE_SIZE_BYTES, memoryManager.pageSizeBytes()),
       memoryManager.getTungstenMemoryMode());
@@ -133,17 +139,32 @@ final class ShuffleExternalSorter extends MemoryConsumer {
     this.peakMemoryUsedBytes = getMemoryUsage();
     this.diskWriteBufferSize =
         (int) (long) conf.get(package$.MODULE$.SHUFFLE_DISK_WRITE_BUFFER_SIZE());
+    this.partitionChecksums = createPartitionChecksums(numPartitions, conf);
+  }
+
+  public long[] getChecksums() {
+    return getChecksumValues(partitionChecksums);
   }
 
   /**
    * Sorts the in-memory records and writes the sorted records to an on-disk file.
    * This method does not free the sort data structures.
    *
-   * @param isLastFile if true, this indicates that we're writing the final output file and that the
-   *                   bytes written should be counted towards shuffle spill metrics rather than
-   *                   shuffle write metrics.
+   * @param isFinalFile if true, this indicates that we're writing the final output file and that
+   *                    the bytes written should be counted towards shuffle write metrics rather
+   *                    than shuffle spill metrics.
    */
-  private void writeSortedFile(boolean isLastFile) {
+  private void writeSortedFile(boolean isFinalFile) {
+    // Only emit the log if this is an actual spilling.
+    if (!isFinalFile) {
+      logger.info(
+        "Task {} on Thread {} spilling sort data of {} to disk ({} {} so far)",
+        taskContext.taskAttemptId(),
+        Thread.currentThread().getId(),
+        Utils.bytesToString(getMemoryUsage()),
+        spills.size(),
+        spills.size() != 1 ? " times" : " time");
+    }
 
     // This call performs the actual sort.
     final ShuffleInMemorySorter.ShuffleSorterIterator sortedRecords =
@@ -156,13 +177,14 @@ final class ShuffleExternalSorter extends MemoryConsumer {
 
     final ShuffleWriteMetricsReporter writeMetricsToUse;
 
-    if (isLastFile) {
+    if (isFinalFile) {
       // We're writing the final non-spill file, so we _do_ want to count this as shuffle bytes.
       writeMetricsToUse = writeMetrics;
     } else {
       // We're spilling, so bytes written should be counted towards spill rather than write.
       // Create a dummy WriteMetrics object to absorb these metrics, since we don't want to count
       // them towards shuffle bytes written.
+      // The actual shuffle bytes written will be counted when we merge the spill files.
       writeMetricsToUse = new ShuffleWriteMetrics();
     }
 
@@ -204,6 +226,9 @@ final class ShuffleExternalSorter extends MemoryConsumer {
             spillInfo.partitionLengths[currentPartition] = fileSegment.length();
           }
           currentPartition = partition;
+          if (partitionChecksums.length > 0) {
+            writer.setChecksum(partitionChecksums[currentPartition]);
+          }
         }
 
         final long recordPointer = sortedRecords.packedRecordPointer.getRecordPointer();
@@ -232,7 +257,7 @@ final class ShuffleExternalSorter extends MemoryConsumer {
       spills.add(spillInfo);
     }
 
-    if (!isLastFile) {  // i.e. this is a spill file
+    if (!isFinalFile) {  // i.e. this is a spill file
       // The current semantics of `shuffleRecordsWritten` seem to be that it's updated when records
       // are written to disk, not when they enter the shuffle sorting code. DiskBlockObjectWriter
       // relies on its `recordWritten()` method being called in order to trigger periodic updates to
@@ -266,12 +291,6 @@ final class ShuffleExternalSorter extends MemoryConsumer {
     if (trigger != this || inMemSorter == null || inMemSorter.numRecords() == 0) {
       return 0L;
     }
-
-    logger.info("Thread {} spilling sort data of {} to disk ({} {} so far)",
-      Thread.currentThread().getId(),
-      Utils.bytesToString(getMemoryUsage()),
-      spills.size(),
-      spills.size() > 1 ? " times" : " time");
 
     writeSortedFile(false);
     final long spillSize = freeMemory();
@@ -426,8 +445,9 @@ final class ShuffleExternalSorter extends MemoryConsumer {
    */
   public SpillInfo[] closeAndGetSpills() throws IOException {
     if (inMemSorter != null) {
-      // Do not count the final file towards the spill count.
-      writeSortedFile(true);
+      // Here we are spilling the remaining data in the buffer. If there is no spill before, this
+      // final spill file will be the final shuffle output file.
+      writeSortedFile(/* isFinalFile = */spills.isEmpty());
       freeMemory();
       inMemSorter.free();
       inMemSorter = null;

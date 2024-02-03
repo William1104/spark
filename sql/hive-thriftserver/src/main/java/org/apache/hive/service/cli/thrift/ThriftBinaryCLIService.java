@@ -1,13 +1,12 @@
-/**
- * Licensed to the Apache Software Foundation (ASF) under one
- * or more contributor license agreements.  See the NOTICE file
- * distributed with this work for additional information
- * regarding copyright ownership.  The ASF licenses this file
- * to you under the Apache License, Version 2.0 (the
- * "License"); you may not use this file except in compliance
- * with the License.  You may obtain a copy of the License at
+/*
+ * Licensed to the Apache Software Foundation (ASF) under one or more
+ * contributor license agreements.  See the NOTICE file distributed with
+ * this work for additional information regarding copyright ownership.
+ * The ASF licenses this file to You under the Apache License, Version 2.0
+ * (the "License"); you may not use this file except in compliance with
+ * the License.  You may obtain a copy of the License at
  *
- *     http://www.apache.org/licenses/LICENSE-2.0
+ *    http://www.apache.org/licenses/LICENSE-2.0
  *
  * Unless required by applicable law or agreed to in writing, software
  * distributed under the License is distributed on an "AS IS" BASIS,
@@ -44,6 +43,7 @@ import org.apache.thrift.server.TThreadPoolServer;
 import org.apache.thrift.transport.TServerSocket;
 import org.apache.thrift.transport.TTransportFactory;
 
+import org.apache.spark.sql.hive.thriftserver.HiveThriftServer2$;
 
 public class ThriftBinaryCLIService extends ThriftCLIService {
 
@@ -138,7 +138,11 @@ public class ThriftBinaryCLIService extends ThriftCLIService {
       LOG.error(
           "Error starting HiveServer2: could not start "
               + ThriftBinaryCLIService.class.getSimpleName(), t);
-      System.exit(-1);
+      if (HiveThriftServer2$.MODULE$.systemExitOnError().get()) {
+        System.exit(-1);
+      } else {
+        throw new ServiceException(t);
+      }
     }
   }
 

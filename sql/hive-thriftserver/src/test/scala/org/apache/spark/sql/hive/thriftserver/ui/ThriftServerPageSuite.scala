@@ -17,6 +17,7 @@
 
 package org.apache.spark.sql.hive.thriftserver.ui
 
+import java.io.File
 import java.util.{Calendar, Locale}
 import javax.servlet.http.HttpServletRequest
 
@@ -34,6 +35,15 @@ class ThriftServerPageSuite extends SparkFunSuite with BeforeAndAfter {
 
   private var kvstore: ElementTrackingStore = _
 
+  protected override def beforeAll(): Unit = {
+    val tmpDirName = System.getProperty("java.io.tmpdir")
+    val tmpDir = new File(tmpDirName)
+    if (!tmpDir.exists()) {
+      tmpDir.mkdirs()
+    }
+    super.beforeAll()
+  }
+
   after {
     if (kvstore != null) {
       kvstore.close()
@@ -50,7 +60,7 @@ class ThriftServerPageSuite extends SparkFunSuite with BeforeAndAfter {
     val sparkConf = new SparkConf
 
     val listener = new HiveThriftServer2Listener(kvstore, sparkConf, Some(server))
-    val statusStore = new HiveThriftServer2AppStatusStore(kvstore, Some(listener))
+    val statusStore = new HiveThriftServer2AppStatusStore(kvstore)
 
     listener.onOtherEvent(SparkListenerThriftServerSessionCreated("localhost", "sessionid", "user",
       System.currentTimeMillis()))

@@ -32,6 +32,7 @@ import org.apache.spark.ml.util._
 import org.apache.spark.sql.{DataFrame, Dataset, SparkSession}
 import org.apache.spark.sql.functions.{col, udf}
 import org.apache.spark.sql.types.{StructField, StructType}
+import org.apache.spark.util.ArrayImplicits._
 
 
 /**
@@ -97,12 +98,15 @@ private[feature] trait UnivariateFeatureSelectorParams extends Params
 }
 
 /**
- * The user can set `featureType` and labelType`, and Spark will pick the score function based on
- * the specified `featureType` and labelType`.
+ * Feature selector based on univariate statistical tests against labels. Currently, Spark
+ * supports three Univariate Feature Selectors: chi-squared, ANOVA F-test and F-value.
+ * User can choose Univariate Feature Selector by setting `featureType` and `labelType`,
+ * and Spark will pick the score function based on the specified `featureType` and `labelType`.
+ *
  * The following combination of `featureType` and `labelType` are supported:
  *  - `featureType` `categorical` and `labelType` `categorical`: Spark uses chi-squared,
  *    i.e. chi2 in sklearn.
- *  - `featureType` `continuous` and `labelType` `categorical`: Spark uses ANOVATest,
+ *  - `featureType` `continuous` and `labelType` `categorical`: Spark uses ANOVA F-test,
  *    i.e. f_classif in sklearn.
  *  - `featureType` `continuous` and `labelType` `continuous`: Spark uses F-value,
  *    i.e. f_regression in sklearn.
@@ -161,7 +165,7 @@ final class UnivariateFeatureSelector @Since("3.1.1")(@Since("3.1.1") override v
   @Since("3.1.1")
   override def fit(dataset: Dataset[_]): UnivariateFeatureSelectorModel = {
     transformSchema(dataset.schema, logging = true)
-    val numFeatures = MetadataUtils.getNumFeatures(dataset, $(featuresCol))
+    val numFeatures = DatasetUtils.getNumFeatures(dataset, $(featuresCol))
 
     var threshold = Double.NaN
     if (isSet(selectionThreshold)) {
@@ -176,11 +180,11 @@ final class UnivariateFeatureSelector @Since("3.1.1")(@Since("3.1.1") override v
 
     val resultDF = ($(featureType), $(labelType)) match {
       case ("categorical", "categorical") =>
-        ChiSquareTest.test(dataset.toDF, getFeaturesCol, getLabelCol, true)
+        ChiSquareTest.test(dataset.toDF(), getFeaturesCol, getLabelCol, true)
       case ("continuous", "categorical") =>
-        ANOVATest.test(dataset.toDF, getFeaturesCol, getLabelCol, true)
+        ANOVATest.test(dataset.toDF(), getFeaturesCol, getLabelCol, true)
       case ("continuous", "continuous") =>
-        FValueTest.test(dataset.toDF, getFeaturesCol, getLabelCol, true)
+        FValueTest.test(dataset.toDF(), getFeaturesCol, getLabelCol, true)
       case _ =>
         throw new IllegalArgumentException(s"Unsupported combination:" +
           s" featureType=${$(featureType)}, labelType=${$(labelType)}")
@@ -224,7 +228,7 @@ final class UnivariateFeatureSelector @Since("3.1.1")(@Since("3.1.1") override v
         val maxIndex = resultDF.sort("pValue", "featureIndex")
           .select("pValue")
           .as[Double].rdd
-          .zipWithIndex
+          .zipWithIndex()
           .flatMap { case (pValue, index) =>
             if (pValue <= f * (index + 1)) {
               Iterator.single(index.toInt)
@@ -346,7 +350,7 @@ object UnivariateFeatureSelectorModel extends MLReadable[UnivariateFeatureSelect
 
     override protected def saveImpl(path: String): Unit = {
       DefaultParamsWriter.saveMetadata(instance, path, sc)
-      val data = Data(instance.selectedFeatures.toSeq)
+      val data = Data(instance.selectedFeatures.toImmutableArraySeq)
       val dataPath = new Path(path, "data").toString
       sparkSession.createDataFrame(Seq(data)).repartition(1).write.parquet(dataPath)
     }

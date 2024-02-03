@@ -23,11 +23,12 @@ import org.apache.spark.sql.catalyst.analysis.ResolvedNamespace
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.dsl.plans._
 import org.apache.spark.sql.catalyst.expressions.{Ascending, Attribute, AttributeMap, AttributeReference, Literal, SortOrder}
-import org.apache.spark.sql.catalyst.plans.PlanTest
+import org.apache.spark.sql.catalyst.plans.{Inner, PlanTest}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.connector.catalog.SupportsNamespaces
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types.{BooleanType, ByteType, IntegerType, LongType}
+import org.apache.spark.util.ArrayImplicits._
 
 class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
   val attribute = attr("key")
@@ -43,6 +44,14 @@ class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
 
   test("range with positive step") {
     val range = Range(1, 5, 1, None)
+    val histogramBins = Array(
+      HistogramBin(1.0, 2.0, 2),
+      HistogramBin(2.0, 3.0, 1),
+      HistogramBin(3.0, 4.0, 1))
+    val histogram = Some(Histogram(4.toDouble / 3, histogramBins))
+    // Number of range elements should be same as number of distinct values
+    assert(range.numElements === 4)
+
     val rangeStats = Statistics(
       sizeInBytes = 4 * 8,
       rowCount = Some(4),
@@ -57,12 +66,23 @@ class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
                 max = Some(4),
                 nullCount = Some(0),
                 maxLen = Some(LongType.defaultSize),
-                avgLen = Some(LongType.defaultSize))))))
-    checkStats(range, expectedStatsCboOn = rangeStats, expectedStatsCboOff = rangeStats)
+                avgLen = Some(LongType.defaultSize),
+                histogram = histogram)))))
+    val extraConfig = Map(SQLConf.HISTOGRAM_ENABLED.key -> "true",
+      SQLConf.HISTOGRAM_NUM_BINS.key -> "3")
+    checkStats(range, expectedStatsCboOn = rangeStats,
+      expectedStatsCboOff = rangeStats, extraConfig)
   }
 
   test("range with positive step where end minus start not divisible by step") {
     val range = Range(-4, 5, 2, None)
+    val histogramBins = Array(
+      HistogramBin(-4.0, -2.0, 2),
+      HistogramBin(-2.0, 2.0, 2),
+      HistogramBin(2.0, 4.0, 1))
+    val histogram = Some(Histogram(5.toDouble / 3, histogramBins))
+    // Number of range elements should be same as number of distinct values
+    assert(range.numElements === 5)
     val rangeStats = Statistics(
       sizeInBytes = 5 * 8,
       rowCount = Some(5),
@@ -77,12 +97,23 @@ class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
                 max = Some(4),
                 nullCount = Some(0),
                 maxLen = Some(LongType.defaultSize),
-                avgLen = Some(LongType.defaultSize))))))
-    checkStats(range, expectedStatsCboOn = rangeStats, expectedStatsCboOff = rangeStats)
+                avgLen = Some(LongType.defaultSize),
+                histogram = histogram)))))
+    val extraConfig = Map(SQLConf.HISTOGRAM_ENABLED.key -> "true",
+      SQLConf.HISTOGRAM_NUM_BINS.key -> "3")
+    checkStats(range, expectedStatsCboOn = rangeStats,
+      expectedStatsCboOff = rangeStats, extraConfig)
   }
 
   test("range with negative step") {
     val range = Range(-10, -20, -2, None)
+    val histogramBins = Array(
+      HistogramBin(-18.0, -16.0, 2),
+      HistogramBin(-16.0, -12.0, 2),
+      HistogramBin(-12.0, -10.0, 1))
+    val histogram = Some(Histogram(5.toDouble / 3, histogramBins))
+    // Number of range elements should be same as number of distinct values
+    assert(range.numElements === 5)
     val rangeStats = Statistics(
       sizeInBytes = 5 * 8,
       rowCount = Some(5),
@@ -97,12 +128,24 @@ class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
                 max = Some(-10),
                 nullCount = Some(0),
                 maxLen = Some(LongType.defaultSize),
-                avgLen = Some(LongType.defaultSize))))))
-    checkStats(range, expectedStatsCboOn = rangeStats, expectedStatsCboOff = rangeStats)
+                avgLen = Some(LongType.defaultSize),
+                histogram = histogram)))))
+    val extraConfig = Map(SQLConf.HISTOGRAM_ENABLED.key -> "true",
+      SQLConf.HISTOGRAM_NUM_BINS.key -> "3")
+    checkStats(range, expectedStatsCboOn = rangeStats,
+      expectedStatsCboOff = rangeStats, extraConfig)
   }
 
   test("range with negative step where end minus start not divisible by step") {
     val range = Range(-10, -20, -3, None)
+    val histogramBins = Array(
+      HistogramBin(-19.0, -16.0, 2),
+      HistogramBin(-16.0, -13.0, 1),
+      HistogramBin(-13.0, -10.0, 1))
+    val histogram = Some(Histogram(4.toDouble / 3, histogramBins))
+    // Number of range elements should be same as number of distinct values
+    assert(range.numElements === 4)
+
     val rangeStats = Statistics(
       sizeInBytes = 4 * 8,
       rowCount = Some(4),
@@ -117,23 +160,62 @@ class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
                 max = Some(-10),
                 nullCount = Some(0),
                 maxLen = Some(LongType.defaultSize),
-                avgLen = Some(LongType.defaultSize))))))
-    checkStats(range, expectedStatsCboOn = rangeStats, expectedStatsCboOff = rangeStats)
+                avgLen = Some(LongType.defaultSize),
+                histogram = histogram)))))
+    val extraConfig = Map(SQLConf.HISTOGRAM_ENABLED.key -> "true",
+      SQLConf.HISTOGRAM_NUM_BINS.key -> "3")
+    checkStats(range, expectedStatsCboOn = rangeStats,
+      expectedStatsCboOff = rangeStats, extraConfig)
   }
 
   test("range with empty output") {
-    val range = Range(-10, -10, -1, None)
-    val rangeStats = Statistics(sizeInBytes = 0, rowCount = Some(0))
-    checkStats(range, expectedStatsCboOn = rangeStats, expectedStatsCboOff = rangeStats)
+      val range = Range(-10, -10, -1, None)
+      val rangeStats = Statistics(sizeInBytes = 0, rowCount = Some(0))
+    val extraConfig = Map(SQLConf.HISTOGRAM_ENABLED.key -> "true",
+      SQLConf.HISTOGRAM_NUM_BINS.key -> "3")
+      checkStats(range, expectedStatsCboOn = rangeStats,
+        expectedStatsCboOff = rangeStats, extraConfig)
   }
 
+test("range with invalid long value") {
+  val numElements = BigInt(Long.MaxValue) - BigInt(Long.MinValue)
+  val range = Range(Long.MinValue, Long.MaxValue, 1, None)
+  val rangeAttrs = AttributeMap(range.output.map(attr =>
+    (attr, ColumnStat(
+      distinctCount = Some(numElements),
+      nullCount = Some(0),
+      maxLen = Some(LongType.defaultSize),
+      avgLen = Some(LongType.defaultSize)))))
+  val rangeStats = Statistics(
+    sizeInBytes = numElements * 8,
+    rowCount = Some(numElements),
+    attributeStats = rangeAttrs)
+  checkStats(range, rangeStats, rangeStats)
+}
+
   test("windows") {
-    val windows = plan.window(Seq(min(attribute).as('sum_attr)), Seq(attribute), Nil)
+    val windows = plan.window(Seq(min(attribute).as("sum_attr")), Seq(attribute), Nil)
     val windowsStats = Statistics(sizeInBytes = plan.size.get * (4 + 4 + 8) / (4 + 8))
     checkStats(
       windows,
       expectedStatsCboOn = windowsStats,
       expectedStatsCboOff = windowsStats)
+  }
+
+  test("offset estimation: offset < child's rowCount") {
+    val offset = Offset(Literal(2), plan)
+    checkStats(offset, Statistics(sizeInBytes = 96, rowCount = Some(8)))
+  }
+
+  test("offset estimation: offset > child's rowCount") {
+    val offset = Offset(Literal(20), plan)
+    checkStats(offset, Statistics(sizeInBytes = 1, rowCount = Some(0)))
+  }
+
+  test("offset estimation: offset = 0") {
+    val offset = Offset(Literal(0), plan)
+    // Offset is equal to zero, so Offset's stats is equal to its child's stats.
+    checkStats(offset, plan.stats.copy(attributeStats = AttributeMap(Nil)))
   }
 
   test("limit estimation: limit < child's rowCount") {
@@ -167,14 +249,14 @@ class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
   }
 
   test("sample estimation") {
-    val sample = Sample(0.0, 0.5, withReplacement = false, (math.random * 1000).toLong, plan)
+    val sample = Sample(0.0, 0.5, withReplacement = false, (math.random() * 1000).toLong, plan)
     checkStats(sample, Statistics(sizeInBytes = 60, rowCount = Some(5)))
 
     // Child doesn't have rowCount in stats
     val childStats = Statistics(sizeInBytes = 120)
     val childPlan = DummyLogicalPlan(childStats, childStats)
     val sample2 =
-      Sample(0.0, 0.11, withReplacement = false, (math.random * 1000).toLong, childPlan)
+      Sample(0.0, 0.11, withReplacement = false, (math.random() * 1000).toLong, childPlan)
     checkStats(sample2, Statistics(sizeInBytes = 14))
   }
 
@@ -203,18 +285,30 @@ class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
 
   test("command should report a dummy stats") {
     val plan = CommentOnNamespace(
-      ResolvedNamespace(mock(classOf[SupportsNamespaces]), Array("ns")), "comment")
+      ResolvedNamespace(mock(classOf[SupportsNamespaces]),
+        Array("ns").toImmutableArraySeq), "comment")
     checkStats(
       plan,
       expectedStatsCboOn = Statistics.DUMMY,
       expectedStatsCboOff = Statistics.DUMMY)
   }
 
-  test("SPARK-33954: Some operator missing rowCount when enable CBO") {
-    checkStats(
-      plan.repartition(10),
-      expectedStatsCboOn = Statistics(sizeInBytes = 120, rowCount = Some(10)),
-      expectedStatsCboOff = Statistics(sizeInBytes = 120))
+  test("Improve Repartition statistics estimation") {
+    // SPARK-35203 for repartition and repartitionByExpr
+    // SPARK-37949 for rebalance
+    Seq(
+      RepartitionByExpression(plan.output, plan, 10),
+      RepartitionByExpression(Nil, plan, None),
+      plan.repartition(2),
+      plan.coalesce(3),
+      plan.rebalance(),
+      plan.rebalance(plan.output: _*)).foreach { rep =>
+      val expectedStats = Statistics(plan.size.get, Some(plan.rowCount), plan.attributeStats)
+      checkStats(
+        rep,
+        expectedStatsCboOn = expectedStats,
+        expectedStatsCboOff = expectedStats)
+    }
   }
 
   test("SPARK-34031: Union operator missing rowCount when enable CBO") {
@@ -224,7 +318,7 @@ class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
     val rowCount = Some(plan.rowCount * childrenSize)
     val attributeStats = AttributeMap(
       Seq(
-        attribute -> ColumnStat(min = Some(1), max = Some(10))))
+        attribute -> ColumnStat(min = Some(1), max = Some(10), nullCount = Some(0))))
     checkStats(
       union,
       expectedStatsCboOn = Statistics(sizeInBytes = sizeInBytes,
@@ -235,13 +329,52 @@ class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
 
   test("SPARK-34121: Intersect operator missing rowCount when enable CBO") {
     val intersect = Intersect(plan, plan, false)
-    val childrenSize = intersect.children.size
     val sizeInBytes = plan.size.get
     val rowCount = Some(plan.rowCount)
     checkStats(
       intersect,
       expectedStatsCboOn = Statistics(sizeInBytes = sizeInBytes, rowCount = rowCount),
       expectedStatsCboOff = Statistics(sizeInBytes = sizeInBytes))
+  }
+
+  test("SPARK-35185: Improve Distinct statistics estimation") {
+    val distinct = Distinct(plan)
+    val sizeInBytes = plan.size.get
+    checkStats(
+      distinct,
+      expectedStatsCboOn = Statistics(sizeInBytes, Some(plan.rowCount), plan.attributeStats),
+      expectedStatsCboOff = Statistics(sizeInBytes = sizeInBytes))
+  }
+
+  test("SPARK-39851: Improve join stats estimation if one side can keep uniqueness") {
+    val brandId = attr("brand_id")
+    val classId = attr("class_id")
+    val aliasedBrandId = brandId.as("new_brand_id")
+    val aliasedClassId = classId.as("new_class_id")
+
+    val tableSize = 4059900
+    val tableRowCnt = 202995
+
+    val tbl = StatsTestPlan(
+      outputList = Seq(brandId, classId),
+      size = Some(tableSize),
+      rowCount = tableRowCnt,
+      attributeStats =
+        AttributeMap(Seq(
+          brandId -> ColumnStat(Some(858), Some(101001), Some(1016017), Some(0), Some(4), Some(4)),
+          classId -> ColumnStat(Some(16), Some(1), Some(16), Some(0), Some(4), Some(4)))))
+
+    val join = Join(
+      tbl,
+      tbl.groupBy(brandId, classId)(aliasedBrandId, aliasedClassId),
+      Inner,
+      Some(brandId === aliasedBrandId.toAttribute && classId === aliasedClassId.toAttribute),
+      JoinHint.NONE)
+
+    checkStats(
+      join,
+      expectedStatsCboOn = Statistics(4871880, Some(tableRowCnt), join.stats.attributeStats),
+      expectedStatsCboOff = Statistics(sizeInBytes = 4059900 * 2))
   }
 
   test("row size and column stats estimation for sort") {
@@ -276,21 +409,23 @@ class BasicStatsEstimationSuite extends PlanTest with StatsEstimationTestBase {
     checkStats(
       sort,
       expectedStatsCboOn = expectedSortStats,
-      expectedStatsCboOff = Statistics(sizeInBytes = expectedSize))
+      expectedStatsCboOff = expectedSortStats)
   }
 
   /** Check estimated stats when cbo is turned on/off. */
   private def checkStats(
       plan: LogicalPlan,
       expectedStatsCboOn: Statistics,
-      expectedStatsCboOff: Statistics): Unit = {
-    withSQLConf(SQLConf.CBO_ENABLED.key -> "true") {
+      expectedStatsCboOff: Statistics,
+      extraConfigs: Map[String, String] = Map.empty): Unit = {
+    val cboEnabledConfig = Seq(SQLConf.CBO_ENABLED.key -> "true") ++ extraConfigs.toSeq
+    withSQLConf(cboEnabledConfig: _*) {
       // Invalidate statistics
       plan.invalidateStatsCache()
       assert(plan.stats == expectedStatsCboOn)
     }
-
-    withSQLConf(SQLConf.CBO_ENABLED.key -> "false") {
+    val cboDisabledConfig = Seq(SQLConf.CBO_ENABLED.key -> "false") ++ extraConfigs.toSeq
+    withSQLConf(cboDisabledConfig: _*) {
       plan.invalidateStatsCache()
       assert(plan.stats == expectedStatsCboOff)
     }

@@ -25,8 +25,19 @@ There are more guides shared with other languages such as
 `Quick Start <https://spark.apache.org/docs/latest/quick-start.html>`_ in Programming Guides
 at `the Spark documentation <https://spark.apache.org/docs/latest/index.html#where-to-go-from-here>`_.
 
-.. toctree::
-    :maxdepth: 2
+There are live notebooks where you can try PySpark out without any other step:
 
-    install
-    quickstart
+* |binder_df|_
+* |binder_connect|_
+* |binder_ps|_
+
+The list below is the contents of this quickstart page:
+
+.. toctree::
+   :maxdepth: 2
+
+   install
+   quickstart_df
+   quickstart_connect
+   quickstart_ps
+   testing_pyspark

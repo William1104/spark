@@ -21,10 +21,11 @@ import java.util.Locale
 
 import scala.collection.mutable
 
-import org.apache.spark.sql.catalyst.expressions.{Ascending, Expression, IntegerLiteral, SortOrder}
+import org.apache.spark.sql.catalyst.expressions.{Ascending, Expression, IntegerLiteral, SortOrder, StringLiteral}
 import org.apache.spark.sql.catalyst.plans.logical._
 import org.apache.spark.sql.catalyst.rules.Rule
 import org.apache.spark.sql.catalyst.trees.CurrentOrigin
+import org.apache.spark.sql.catalyst.trees.TreePattern.UNRESOLVED_HINT
 import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.SQLConf
 
@@ -119,7 +120,7 @@ object ResolveHints {
           case r: SubqueryAlias if matchedIdentifierInHint(extractIdentifier(r)) =>
             ResolvedHint(plan, createHintInfo(hintName))
 
-          case _: ResolvedHint | _: View | _: With | _: SubqueryAlias =>
+          case _: ResolvedHint | _: View | _: UnresolvedWith | _: SubqueryAlias =>
             // Don't traverse down these nodes.
             // For an existing strategy hint, there is no chance for a match from this point down.
             // The rest (view, with, subquery) indicates different scopes that we shouldn't traverse
@@ -143,7 +144,8 @@ object ResolveHints {
       }
     }
 
-    def apply(plan: LogicalPlan): LogicalPlan = plan resolveOperatorsUp {
+    def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsUpWithPruning(
+      _.containsPattern(UNRESOLVED_HINT), ruleId) {
       case h: UnresolvedHint if STRATEGY_HINT_NAMES.contains(h.name.toUpperCase(Locale.ROOT)) =>
         if (h.parameters.isEmpty) {
           // If there is no table alias specified, apply the hint on the entire subtree.
@@ -151,7 +153,7 @@ object ResolveHints {
         } else {
           // Otherwise, find within the subtree query plans to apply the hint.
           val relationNamesInHint = h.parameters.map {
-            case tableName: String => UnresolvedAttribute.parseAttributeName(tableName)
+            case StringLiteral(tableName) => UnresolvedAttribute.parseAttributeName(tableName)
             case tableId: UnresolvedAttribute => tableId.nameParts
             case unsupported =>
               throw QueryCompilationErrors.joinStrategyHintParameterNotSupportedError(unsupported)
@@ -173,7 +175,8 @@ object ResolveHints {
    */
   object ResolveCoalesceHints extends Rule[LogicalPlan] {
 
-    val COALESCE_HINT_NAMES: Set[String] = Set("COALESCE", "REPARTITION", "REPARTITION_BY_RANGE")
+    val COALESCE_HINT_NAMES: Set[String] =
+      Set("COALESCE", "REPARTITION", "REPARTITION_BY_RANGE", "REBALANCE")
 
     /**
      * This function handles hints for "COALESCE" and "REPARTITION".
@@ -201,15 +204,11 @@ object ResolveHints {
       hint.parameters match {
         case Seq(IntegerLiteral(numPartitions)) =>
           Repartition(numPartitions, shuffle, hint.child)
-        case Seq(numPartitions: Int) =>
-          Repartition(numPartitions, shuffle, hint.child)
         // The "COALESCE" hint (shuffle = false) must have a partition number only
         case _ if !shuffle =>
           throw QueryCompilationErrors.invalidCoalesceHintParameterError(hintName)
 
         case param @ Seq(IntegerLiteral(numPartitions), _*) if shuffle =>
-          createRepartitionByExpression(Some(numPartitions), param.tail)
-        case param @ Seq(numPartitions: Int, _*) if shuffle =>
           createRepartitionByExpression(Some(numPartitions), param.tail)
         case param @ Seq(_*) if shuffle =>
           createRepartitionByExpression(None, param)
@@ -239,21 +238,54 @@ object ResolveHints {
       hint.parameters match {
         case param @ Seq(IntegerLiteral(numPartitions), _*) =>
           createRepartitionByExpression(Some(numPartitions), param.tail)
-        case param @ Seq(numPartitions: Int, _*) =>
-          createRepartitionByExpression(Some(numPartitions), param.tail)
         case param @ Seq(_*) =>
           createRepartitionByExpression(None, param)
       }
     }
 
-    def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperators {
+    private def createRebalance(hint: UnresolvedHint): LogicalPlan = {
+      def createRebalancePartitions(
+          partitionExprs: Seq[Any], initialNumPartitions: Option[Int]): RebalancePartitions = {
+        val invalidParams = partitionExprs.filter(!_.isInstanceOf[UnresolvedAttribute])
+        if (invalidParams.nonEmpty) {
+          val hintName = hint.name.toUpperCase(Locale.ROOT)
+          throw QueryCompilationErrors.invalidHintParameterError(hintName, invalidParams)
+        }
+        RebalancePartitions(
+          partitionExprs.map(_.asInstanceOf[Expression]),
+          hint.child,
+          initialNumPartitions)
+      }
+
+      hint.parameters match {
+        case param @ Seq(IntegerLiteral(numPartitions), _*) =>
+          createRebalancePartitions(param.tail, Some(numPartitions))
+        case partitionExprs @ Seq(_*) =>
+          createRebalancePartitions(partitionExprs, None)
+      }
+    }
+
+    private def transformStringToAttribute(hint: UnresolvedHint): UnresolvedHint = {
+      // for all the coalesce hints, it's safe to transform the string literal to an attribute as
+      // all the parameters should be column names.
+      val parameters = hint.parameters.map {
+        case StringLiteral(name) => UnresolvedAttribute(name)
+        case e => e
+      }
+      hint.copy(parameters = parameters)
+    }
+
+    def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsWithPruning(
+      _.containsPattern(UNRESOLVED_HINT), ruleId) {
       case hint @ UnresolvedHint(hintName, _, _) => hintName.toUpperCase(Locale.ROOT) match {
           case "REPARTITION" =>
-            createRepartition(shuffle = true, hint)
+            createRepartition(shuffle = true, transformStringToAttribute(hint))
           case "COALESCE" =>
-            createRepartition(shuffle = false, hint)
+            createRepartition(shuffle = false, transformStringToAttribute(hint))
           case "REPARTITION_BY_RANGE" =>
-            createRepartitionByRange(hint)
+            createRepartitionByRange(transformStringToAttribute(hint))
+          case "REBALANCE" if conf.adaptiveExecutionEnabled =>
+            createRebalance(transformStringToAttribute(hint))
           case _ => hint
         }
     }
@@ -267,7 +299,8 @@ object ResolveHints {
 
     private def hintErrorHandler = conf.hintErrorHandler
 
-    def apply(plan: LogicalPlan): LogicalPlan = plan resolveOperatorsUp {
+    def apply(plan: LogicalPlan): LogicalPlan = plan.resolveOperatorsUpWithPruning(
+      _.containsPattern(UNRESOLVED_HINT)) {
       case h: UnresolvedHint =>
         hintErrorHandler.hintNotRecognized(h.name, h.parameters)
         h.child

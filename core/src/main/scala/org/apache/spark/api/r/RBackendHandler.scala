@@ -29,6 +29,7 @@ import org.apache.spark.api.r.SerDe._
 import org.apache.spark.internal.Logging
 import org.apache.spark.internal.config.R._
 import org.apache.spark.util.{ThreadUtils, Utils}
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * Handler for RBackend
@@ -165,7 +166,7 @@ private[r] class RBackendHandler(server: RBackend)
 
         // Write status bit
         writeInt(dos, 0)
-        writeObject(dos, ret.asInstanceOf[AnyRef], server.jvmObjectTracker)
+        writeObject(dos, ret, server.jvmObjectTracker)
       } else if (methodName == "<init>") {
         // methodName should be "<init>" for constructor
         val ctors = cls.getConstructors
@@ -266,7 +267,7 @@ private[r] class RBackendHandler(server: RBackend)
           for (i <- 0 until numArgs) {
             if (parameterTypes(i) == classOf[Seq[Any]] && args(i).getClass.isArray) {
               // Convert a Java array to scala Seq
-              args(i) = args(i).asInstanceOf[Array[_]].toSeq
+              args(i) = args(i).asInstanceOf[Array[_]].toImmutableArraySeq
             }
           }
 

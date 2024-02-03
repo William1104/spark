@@ -20,6 +20,8 @@ package org.apache.spark.sql.catalyst.optimizer
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.catalyst.trees.TreePattern.{CREATE_NAMED_STRUCT, EXTRACT_VALUE,
+  JSON_TO_STRUCT}
 import org.apache.spark.sql.types.{ArrayType, StructType}
 
 /**
@@ -37,16 +39,20 @@ import org.apache.spark.sql.types.{ArrayType, StructType}
 object OptimizeCsvJsonExprs extends Rule[LogicalPlan] {
   private def nameOfCorruptRecord = conf.columnNameOfCorruptRecord
 
-  override def apply(plan: LogicalPlan): LogicalPlan = plan transform {
+  override def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(
+    _.containsAnyPattern(CREATE_NAMED_STRUCT, EXTRACT_VALUE, JSON_TO_STRUCT), ruleId) {
     case p =>
       val optimized = if (conf.jsonExpressionOptimization) {
-        p.transformExpressions(jsonOptimization)
+        p.transformExpressionsWithPruning(
+          _.containsAnyPattern(CREATE_NAMED_STRUCT, EXTRACT_VALUE, JSON_TO_STRUCT)
+          )(jsonOptimization)
       } else {
         p
       }
 
       if (conf.csvExpressionOptimization) {
-        optimized.transformExpressions(csvOptimization)
+        optimized.transformExpressionsWithPruning(
+          _.containsAnyPattern(EXTRACT_VALUE))(csvOptimization)
       } else {
         optimized
       }
@@ -103,12 +109,12 @@ object OptimizeCsvJsonExprs extends Rule[LogicalPlan] {
         // optimize, and should force to parse the whole input JSON with failing fast for
         // an invalid input.
         // To be more conservative, it does not optimize when any option is set for now.
-      val prunedSchema = StructType(Seq(schema(ordinal)))
+      val prunedSchema = StructType(Array(schema(ordinal)))
       g.copy(child = j.copy(schema = prunedSchema), ordinal = 0)
 
     case g @ GetArrayStructFields(j @ JsonToStructs(schema: ArrayType, _, _, _), _, _, _, _)
         if schema.elementType.asInstanceOf[StructType].length > 1 && j.options.isEmpty =>
-      val prunedSchema = ArrayType(StructType(Seq(g.field)), g.containsNull)
+      val prunedSchema = ArrayType(StructType(Array(g.field)), g.containsNull)
       g.copy(child = j.copy(schema = prunedSchema), ordinal = 0, numFields = 1)
   }
 
@@ -118,7 +124,7 @@ object OptimizeCsvJsonExprs extends Rule[LogicalPlan] {
         // When the parse mode is permissive, and corrupt column is not selected, we can prune here
         // from `GetStructField`. To be more conservative, it does not optimize when any option
         // is set.
-      val prunedSchema = StructType(Seq(schema(ordinal)))
+      val prunedSchema = StructType(Array(schema(ordinal)))
       g.copy(child = c.copy(requiredSchema = Some(prunedSchema)), ordinal = 0)
   }
 }

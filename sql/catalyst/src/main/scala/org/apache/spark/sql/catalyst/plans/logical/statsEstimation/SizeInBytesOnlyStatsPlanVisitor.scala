@@ -17,8 +17,9 @@
 
 package org.apache.spark.sql.catalyst.plans.logical.statsEstimation
 
-import org.apache.spark.sql.catalyst.expressions.AttributeMap
-import org.apache.spark.sql.catalyst.plans.{LeftAnti, LeftSemi}
+import org.apache.spark.sql.catalyst.expressions.{AttributeMap, ExpressionSet}
+import org.apache.spark.sql.catalyst.planning.ExtractEquiJoinKeys
+import org.apache.spark.sql.catalyst.plans._
 import org.apache.spark.sql.catalyst.plans.logical._
 
 /**
@@ -67,7 +68,7 @@ object SizeInBytesOnlyStatsPlanVisitor extends LogicalPlanVisitor[Statistics] {
     }
   }
 
-  override def visitDistinct(p: Distinct): Statistics = default(p)
+  override def visitDistinct(p: Distinct): Statistics = visitUnaryNode(p)
 
   override def visitExcept(p: Except): Statistics = p.left.stats.copy()
 
@@ -90,6 +91,15 @@ object SizeInBytesOnlyStatsPlanVisitor extends LogicalPlanVisitor[Statistics] {
       rowCount = Some(rowCount))
   }
 
+  override def visitOffset(p: Offset): Statistics = {
+    val offset = p.offsetExpr.eval().asInstanceOf[Int]
+    val childStats = p.child.stats
+    val rowCount: BigInt = childStats.rowCount.map(c => c - offset).map(_.max(0)).getOrElse(0)
+    Statistics(
+      sizeInBytes = EstimationUtils.getOutputSize(p.output, rowCount, childStats.attributeStats),
+      rowCount = Some(rowCount))
+  }
+
   override def visitIntersect(p: Intersect): Statistics = {
     val leftSize = p.left.stats.sizeInBytes
     val rightSize = p.right.stats.sizeInBytes
@@ -103,6 +113,16 @@ object SizeInBytesOnlyStatsPlanVisitor extends LogicalPlanVisitor[Statistics] {
       case LeftAnti | LeftSemi =>
         // LeftSemi and LeftAnti won't ever be bigger than left
         p.left.stats
+      case Inner | LeftOuter | RightOuter | FullOuter =>
+        p match {
+          case ExtractEquiJoinKeys(_, leftKeys, rightKeys, _, _, left, right, _)
+              if left.distinctKeys.exists(_.subsetOf(ExpressionSet(leftKeys))) ||
+                right.distinctKeys.exists(_.subsetOf(ExpressionSet(rightKeys))) =>
+            // The sizeInBytes should be > 1 because sizeInBytes * 1 != sizeInBytes + 1.
+            Statistics(sizeInBytes = p.children.map(_.stats.sizeInBytes).filter(_ > 1L).sum)
+          case _ =>
+            default(p)
+        }
       case _ =>
         default(p)
     }
@@ -128,9 +148,11 @@ object SizeInBytesOnlyStatsPlanVisitor extends LogicalPlanVisitor[Statistics] {
 
   override def visitProject(p: Project): Statistics = visitUnaryNode(p)
 
-  override def visitRepartition(p: Repartition): Statistics = default(p)
+  override def visitRepartition(p: Repartition): Statistics = p.child.stats
 
-  override def visitRepartitionByExpr(p: RepartitionByExpression): Statistics = default(p)
+  override def visitRepartitionByExpr(p: RepartitionByExpression): Statistics = p.child.stats
+
+  override def visitRebalancePartitions(p: RebalancePartitions): Statistics = p.child.stats
 
   override def visitSample(p: Sample): Statistics = {
     val ratio = p.upperBound - p.lowerBound
@@ -151,7 +173,7 @@ object SizeInBytesOnlyStatsPlanVisitor extends LogicalPlanVisitor[Statistics] {
 
   override def visitWindow(p: Window): Statistics = visitUnaryNode(p)
 
-  override def visitSort(p: Sort): Statistics = default(p)
+  override def visitSort(p: Sort): Statistics = p.child.stats
 
   override def visitTail(p: Tail): Statistics = {
     val limit = p.limitExpr.eval().asInstanceOf[Int]
@@ -161,4 +183,6 @@ object SizeInBytesOnlyStatsPlanVisitor extends LogicalPlanVisitor[Statistics] {
       sizeInBytes = EstimationUtils.getOutputSize(p.output, rowCount, childStats.attributeStats),
       rowCount = Some(rowCount))
   }
+
+  override def visitWithCTE(p: WithCTE): Statistics = p.plan.stats
 }

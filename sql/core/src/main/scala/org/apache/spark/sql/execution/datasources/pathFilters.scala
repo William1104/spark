@@ -21,8 +21,8 @@ import java.util.{Locale, TimeZone}
 
 import org.apache.hadoop.fs.{FileStatus, GlobFilter}
 
-import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.util.{CaseInsensitiveMap, DateTimeUtils}
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.unsafe.types.UTF8String
 
@@ -43,10 +43,8 @@ class PathGlobFilter(filePatten: String) extends PathFilterStrategy {
 }
 
 object PathGlobFilter extends StrategyBuilder {
-  val PARAM_NAME = "pathglobfilter"
-
   override def create(parameters: CaseInsensitiveMap[String]): Option[PathFilterStrategy] = {
-    parameters.get(PARAM_NAME).map(new PathGlobFilter(_))
+    parameters.get(FileIndexOptions.PATH_GLOB_FILTER).map(new PathGlobFilter(_))
   }
 }
 
@@ -91,9 +89,7 @@ object ModifiedDateFilter {
     val timeZone: TimeZone = DateTimeUtils.getTimeZone(timeZoneId)
     val ts = UTF8String.fromString(timeString)
     DateTimeUtils.stringToTimestamp(ts, timeZone.toZoneId).getOrElse {
-      throw new AnalysisException(
-        s"The timestamp provided for the '$strategy' option is invalid. The expected format " +
-          s"is 'YYYY-MM-DDTHH:mm:ss', but the provided timestamp: $timeString")
+      throw QueryCompilationErrors.invalidTimestampProvidedForStrategyError(strategy, timeString)
     }
   }
 }
@@ -113,12 +109,10 @@ class ModifiedBeforeFilter(thresholdTime: Long, val timeZoneId: String)
 object ModifiedBeforeFilter extends StrategyBuilder {
   import ModifiedDateFilter._
 
-  val PARAM_NAME = "modifiedbefore"
-
   override def create(parameters: CaseInsensitiveMap[String]): Option[PathFilterStrategy] = {
-    parameters.get(PARAM_NAME).map { value =>
+    parameters.get(FileIndexOptions.MODIFIED_BEFORE).map { value =>
       val timeZoneId = getTimeZoneId(parameters)
-      val thresholdTime = toThreshold(value, timeZoneId, PARAM_NAME)
+      val thresholdTime = toThreshold(value, timeZoneId, FileIndexOptions.MODIFIED_BEFORE)
       new ModifiedBeforeFilter(thresholdTime, timeZoneId)
     }
   }
@@ -139,12 +133,10 @@ class ModifiedAfterFilter(thresholdTime: Long, val timeZoneId: String)
 object ModifiedAfterFilter extends StrategyBuilder {
   import ModifiedDateFilter._
 
-  val PARAM_NAME = "modifiedafter"
-
   override def create(parameters: CaseInsensitiveMap[String]): Option[PathFilterStrategy] = {
-    parameters.get(PARAM_NAME).map { value =>
+    parameters.get(FileIndexOptions.MODIFIED_AFTER).map { value =>
       val timeZoneId = getTimeZoneId(parameters)
-      val thresholdTime = toThreshold(value, timeZoneId, PARAM_NAME)
+      val thresholdTime = toThreshold(value, timeZoneId, FileIndexOptions.MODIFIED_AFTER)
       new ModifiedAfterFilter(thresholdTime, timeZoneId)
     }
   }

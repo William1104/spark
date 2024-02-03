@@ -17,12 +17,12 @@
 
 package org.apache.spark.sql.catalyst.expressions.aggregate
 
-import org.apache.spark.sql.AnalysisException
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult
 import org.apache.spark.sql.catalyst.analysis.TypeCheckResult.TypeCheckSuccess
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.trees.UnaryLike
+import org.apache.spark.sql.errors.QueryCompilationErrors
 import org.apache.spark.sql.types._
 
 /**
@@ -61,9 +61,6 @@ case class First(child: Expression, ignoreNulls: Boolean)
   }
 
   override def nullable: Boolean = true
-
-  // First is not a deterministic function.
-  override lazy val deterministic: Boolean = false
 
   // Return data type.
   override def dataType: DataType = child.dataType
@@ -125,7 +122,7 @@ case class First(child: Expression, ignoreNulls: Boolean)
 object FirstLast {
   def validateIgnoreNullExpr(exp: Expression, funcName: String): Boolean = exp match {
     case Literal(b: Boolean, BooleanType) => b
-    case _ => throw new AnalysisException(
-      s"The second argument in $funcName should be a boolean literal.")
+    case _ => throw QueryCompilationErrors.secondArgumentInFunctionIsNotBooleanLiteralError(
+      funcName)
   }
 }

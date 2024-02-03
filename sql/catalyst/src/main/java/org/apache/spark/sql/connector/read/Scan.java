@@ -17,8 +17,12 @@
 
 package org.apache.spark.sql.connector.read;
 
+import java.util.Map;
+
+import org.apache.spark.SparkUnsupportedOperationException;
 import org.apache.spark.annotation.Evolving;
-import org.apache.spark.sql.connector.CustomMetric;
+import org.apache.spark.sql.connector.metric.CustomMetric;
+import org.apache.spark.sql.connector.metric.CustomTaskMetric;
 import org.apache.spark.sql.connector.read.streaming.ContinuousStream;
 import org.apache.spark.sql.connector.read.streaming.MicroBatchStream;
 import org.apache.spark.sql.types.StructType;
@@ -65,11 +69,16 @@ public interface Scan {
    * exception, data sources must overwrite this method to provide an implementation, if the
    * {@link Table} that creates this scan returns {@link TableCapability#BATCH_READ} support in its
    * {@link Table#capabilities()}.
+   * <p>
+   * If the scan supports runtime filtering and implements {@link SupportsRuntimeFiltering},
+   * this method may be called multiple times. Therefore, implementations can cache some state
+   * to avoid planning the job twice.
    *
    * @throws UnsupportedOperationException
    */
   default Batch toBatch() {
-    throw new UnsupportedOperationException(description() + ": Batch scan are not supported");
+    throw new SparkUnsupportedOperationException(
+      "_LEGACY_ERROR_TEMP_3147", Map.of("description", description()));
   }
 
   /**
@@ -85,7 +94,8 @@ public interface Scan {
    * @throws UnsupportedOperationException
    */
   default MicroBatchStream toMicroBatchStream(String checkpointLocation) {
-    throw new UnsupportedOperationException(description() + ": Micro-batch scan are not supported");
+    throw new SparkUnsupportedOperationException(
+      "_LEGACY_ERROR_TEMP_3148", Map.of("description", description()));
   }
 
   /**
@@ -101,7 +111,8 @@ public interface Scan {
    * @throws UnsupportedOperationException
    */
   default ContinuousStream toContinuousStream(String checkpointLocation) {
-    throw new UnsupportedOperationException(description() + ": Continuous scan are not supported");
+    throw new SparkUnsupportedOperationException(
+      "_LEGACY_ERROR_TEMP_3149", Map.of("description", description()));
   }
 
   /**
@@ -109,7 +120,41 @@ public interface Scan {
    * By default it returns empty array.
    */
   default CustomMetric[] supportedCustomMetrics() {
-    CustomMetric[] NO_METRICS = {};
-    return NO_METRICS;
+    return new CustomMetric[]{};
+  }
+
+  /**
+   * Returns an array of custom metrics which are collected with values at the driver side only.
+   * Note that these metrics must be included in the supported custom metrics reported by
+   * `supportedCustomMetrics`.
+   *
+   * @since 3.4.0
+   */
+  default CustomTaskMetric[] reportDriverMetrics() {
+    return new CustomTaskMetric[]{};
+  }
+
+  /**
+   * This enum defines how the columnar support for the partitions of the data source
+   * should be determined. The default value is `PARTITION_DEFINED` which indicates that each
+   * partition can determine if it should be columnar or not. SUPPORTED and UNSUPPORTED provide
+   * default shortcuts to indicate support for columnar data or not.
+   *
+   * @since 3.5.0
+   */
+  enum ColumnarSupportMode {
+    PARTITION_DEFINED,
+    SUPPORTED,
+    UNSUPPORTED
+  }
+
+  /**
+   * Subclasses can implement this method to indicate if the support for columnar data should
+   * be determined by each partition or is set as a default for the whole scan.
+   *
+   * @since 3.5.0
+   */
+  default ColumnarSupportMode columnarSupportMode() {
+    return ColumnarSupportMode.PARTITION_DEFINED;
   }
 }

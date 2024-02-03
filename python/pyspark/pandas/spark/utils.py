@@ -17,7 +17,29 @@
 """
 Helpers and utilities to deal with PySpark instances
 """
+from typing import overload
+
 from pyspark.sql.types import DecimalType, StructType, MapType, ArrayType, StructField, DataType
+
+
+@overload
+def as_nullable_spark_type(dt: StructType) -> StructType:
+    ...
+
+
+@overload
+def as_nullable_spark_type(dt: ArrayType) -> ArrayType:
+    ...
+
+
+@overload
+def as_nullable_spark_type(dt: MapType) -> MapType:
+    ...
+
+
+@overload
+def as_nullable_spark_type(dt: DataType) -> DataType:
+    ...
 
 
 def as_nullable_spark_type(dt: DataType) -> DataType:
@@ -30,7 +52,7 @@ def as_nullable_spark_type(dt: DataType) -> DataType:
     >>> as_nullable_spark_type(StructType([
     ...     StructField("A", IntegerType(), True),
     ...     StructField("B", FloatType(), False)]))  # doctest: +NORMALIZE_WHITESPACE
-    StructType(List(StructField(A,IntegerType,true),StructField(B,FloatType,true)))
+    StructType([StructField('A', IntegerType(), True), StructField('B', FloatType(), True)])
 
     >>> as_nullable_spark_type(StructType([
     ...     StructField("A",
@@ -40,9 +62,12 @@ def as_nullable_spark_type(dt: DataType) -> DataType:
     ...                 ArrayType(IntegerType(), False), False), False),
     ...             StructField('b', StringType(), True)])),
     ...     StructField("B", FloatType(), False)]))  # doctest: +NORMALIZE_WHITESPACE
-    StructType(List(StructField(A,StructType(List(StructField(a,MapType(IntegerType,ArrayType\
-(IntegerType,true),true),true),StructField(b,StringType,true))),true),\
-StructField(B,FloatType,true)))
+    StructType([StructField('A',
+        StructType([StructField('a',
+            MapType(IntegerType(),
+            ArrayType(IntegerType(), True), True), True),
+        StructField('b', StringType(), True)]), True),
+    StructField('B', FloatType(), True)])
     """
     if isinstance(dt, StructType):
         new_fields = []
@@ -68,7 +93,37 @@ StructField(B,FloatType,true)))
         return dt
 
 
-def force_decimal_precision_scale(dt: DataType, precision: int = 38, scale: int = 18) -> DataType:
+@overload
+def force_decimal_precision_scale(
+    dt: StructType, *, precision: int = ..., scale: int = ...
+) -> StructType:
+    ...
+
+
+@overload
+def force_decimal_precision_scale(
+    dt: ArrayType, *, precision: int = ..., scale: int = ...
+) -> ArrayType:
+    ...
+
+
+@overload
+def force_decimal_precision_scale(
+    dt: MapType, *, precision: int = ..., scale: int = ...
+) -> MapType:
+    ...
+
+
+@overload
+def force_decimal_precision_scale(
+    dt: DataType, *, precision: int = ..., scale: int = ...
+) -> DataType:
+    ...
+
+
+def force_decimal_precision_scale(
+    dt: DataType, *, precision: int = 38, scale: int = 18
+) -> DataType:
     """
     Returns a data type with a fixed decimal type.
 
@@ -80,7 +135,8 @@ def force_decimal_precision_scale(dt: DataType, precision: int = 38, scale: int 
     >>> force_decimal_precision_scale(StructType([
     ...     StructField("A", DecimalType(10, 0), True),
     ...     StructField("B", DecimalType(14, 7), False)]))  # doctest: +NORMALIZE_WHITESPACE
-    StructType(List(StructField(A,DecimalType(38,18),true),StructField(B,DecimalType(38,18),false)))
+    StructType([StructField('A', DecimalType(38,18), True),
+                StructField('B', DecimalType(38,18), False)])
 
     >>> force_decimal_precision_scale(StructType([
     ...     StructField("A",
@@ -91,9 +147,12 @@ def force_decimal_precision_scale(dt: DataType, precision: int = 38, scale: int 
     ...             StructField('b', StringType(), True)])),
     ...     StructField("B", DecimalType(30, 15), False)]),
     ...     precision=30, scale=15)  # doctest: +NORMALIZE_WHITESPACE
-    StructType(List(StructField(A,StructType(List(StructField(a,MapType(DecimalType(30,15),\
-ArrayType(DecimalType(30,15),false),false),false),StructField(b,StringType,true))),true),\
-StructField(B,DecimalType(30,15),false)))
+    StructType([StructField('A',
+        StructType([StructField('a',
+            MapType(DecimalType(30,15),
+            ArrayType(DecimalType(30,15), False), False), False),
+        StructField('b', StringType(), True)]), True),
+    StructField('B', DecimalType(30,15), False)])
     """
     if isinstance(dt, StructType):
         new_fields = []
@@ -101,7 +160,7 @@ StructField(B,DecimalType(30,15),false)))
             new_fields.append(
                 StructField(
                     field.name,
-                    force_decimal_precision_scale(field.dataType, precision, scale),
+                    force_decimal_precision_scale(field.dataType, precision=precision, scale=scale),
                     nullable=field.nullable,
                     metadata=field.metadata,
                 )
@@ -109,13 +168,13 @@ StructField(B,DecimalType(30,15),false)))
         return StructType(new_fields)
     elif isinstance(dt, ArrayType):
         return ArrayType(
-            force_decimal_precision_scale(dt.elementType, precision, scale),
+            force_decimal_precision_scale(dt.elementType, precision=precision, scale=scale),
             containsNull=dt.containsNull,
         )
     elif isinstance(dt, MapType):
         return MapType(
-            force_decimal_precision_scale(dt.keyType, precision, scale),
-            force_decimal_precision_scale(dt.valueType, precision, scale),
+            force_decimal_precision_scale(dt.keyType, precision=precision, scale=scale),
+            force_decimal_precision_scale(dt.valueType, precision=precision, scale=scale),
             valueContainsNull=dt.valueContainsNull,
         )
     elif isinstance(dt, DecimalType):
@@ -124,7 +183,7 @@ StructField(B,DecimalType(30,15),false)))
         return dt
 
 
-def _test():
+def _test() -> None:
     import doctest
     import sys
     import pyspark.pandas.spark.utils

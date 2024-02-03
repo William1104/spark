@@ -31,6 +31,8 @@ import org.apache.spark.sql.types.{BooleanType, DoubleType, IntegerType, StructT
 
 class ExistenceJoinSuite extends SparkPlanTest with SharedSparkSession {
 
+  private val EnsureRequirements = new EnsureRequirements()
+
   private lazy val left = spark.createDataFrame(
     sparkContext.parallelize(Seq(
       Row(1, 2.0),
@@ -63,15 +65,15 @@ class ExistenceJoinSuite extends SparkPlanTest with SharedSparkSession {
       Row(6, null)
     )), new StructType().add("c", IntegerType).add("d", DoubleType))
 
-  private lazy val singleConditionEQ = (left.col("a") === right.col("c")).expr
+  private lazy val singleConditionEQ = EqualTo(left.col("a").expr, right.col("c").expr)
 
   private lazy val composedConditionEQ = {
-    And((left.col("a") === right.col("c")).expr,
+    And(EqualTo(left.col("a").expr, right.col("c").expr),
       LessThan(left.col("b").expr, right.col("d").expr))
   }
 
   private lazy val composedConditionNEQ = {
-    And((left.col("a") < right.col("c")).expr,
+    And(LessThan(left.col("a").expr, right.col("c").expr),
       LessThan(left.col("b").expr, right.col("d").expr))
   }
 
@@ -104,7 +106,7 @@ class ExistenceJoinSuite extends SparkPlanTest with SharedSparkSession {
     }
 
     testWithWholeStageCodegenOnAndOff(s"$testName using ShuffledHashJoin") { _ =>
-      extractJoinParts().foreach { case (_, leftKeys, rightKeys, boundCondition, _, _, _) =>
+      extractJoinParts().foreach { case (_, leftKeys, rightKeys, boundCondition, _, _, _, _) =>
         withSQLConf(SQLConf.SHUFFLE_PARTITIONS.key -> "1") {
           checkAnswer2(leftRows, rightRows, (left: SparkPlan, right: SparkPlan) =>
             EnsureRequirements.apply(
@@ -123,7 +125,7 @@ class ExistenceJoinSuite extends SparkPlanTest with SharedSparkSession {
     }
 
     testWithWholeStageCodegenOnAndOff(s"$testName using BroadcastHashJoin") { _ =>
-      extractJoinParts().foreach { case (_, leftKeys, rightKeys, boundCondition, _, _, _) =>
+      extractJoinParts().foreach { case (_, leftKeys, rightKeys, boundCondition, _, _, _, _) =>
         withSQLConf(SQLConf.SHUFFLE_PARTITIONS.key -> "1") {
           checkAnswer2(leftRows, rightRows, (left: SparkPlan, right: SparkPlan) =>
             EnsureRequirements.apply(
@@ -141,8 +143,8 @@ class ExistenceJoinSuite extends SparkPlanTest with SharedSparkSession {
       }
     }
 
-    test(s"$testName using SortMergeJoin") {
-      extractJoinParts().foreach { case (_, leftKeys, rightKeys, boundCondition, _, _, _) =>
+    testWithWholeStageCodegenOnAndOff(s"$testName using SortMergeJoin") { _ =>
+      extractJoinParts().foreach { case (_, leftKeys, rightKeys, boundCondition, _, _, _, _) =>
         withSQLConf(SQLConf.SHUFFLE_PARTITIONS.key -> "1") {
           checkAnswer2(leftRows, rightRows, (left: SparkPlan, right: SparkPlan) =>
             EnsureRequirements.apply(
@@ -296,7 +298,7 @@ class ExistenceJoinSuite extends SparkPlanTest with SharedSparkSession {
     LeftAnti,
     left,
     rightUniqueKey,
-    Some((left.col("a") === rightUniqueKey.col("c") && left.col("b") < rightUniqueKey.col("d"))
-      .expr),
+    Some(And(EqualTo(left.col("a").expr, rightUniqueKey.col("c").expr),
+      LessThan(left.col("b").expr, rightUniqueKey.col("d").expr))),
     Seq(Row(1, 2.0), Row(1, 2.0), Row(3, 3.0), Row(null, null), Row(null, 5.0), Row(6, null)))
 }

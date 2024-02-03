@@ -22,8 +22,9 @@ import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.connector.read.InputPartition
 import org.apache.spark.sql.connector.read.streaming.ContinuousPartitionReaderFactory
-import org.apache.spark.sql.execution.metric.SQLMetric
+import org.apache.spark.sql.execution.metric.{CustomMetrics, SQLMetric}
 import org.apache.spark.sql.types.StructType
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.NextIterator
 
 class ContinuousDataSourceRDDPartition(
@@ -92,10 +93,14 @@ class ContinuousDataSourceRDD(
 
     val partitionReader = readerForPartition.getPartitionReader()
     new NextIterator[InternalRow] {
+      private var numRow = 0L
+
       override def getNext(): InternalRow = {
-        partitionReader.currentMetricsValues.foreach { metric =>
-          customMetrics(metric.name()).set(metric.value())
+        if (numRow % CustomMetrics.NUM_ROWS_PER_UPDATE == 0) {
+          CustomMetrics.updateMetrics(
+            partitionReader.currentMetricsValues.toImmutableArraySeq, customMetrics)
         }
+        numRow += 1
         readerForPartition.next() match {
           case null =>
             finished = true
@@ -109,6 +114,6 @@ class ContinuousDataSourceRDD(
   }
 
   override def getPreferredLocations(split: Partition): Seq[String] = {
-    castPartition(split).inputPartition.preferredLocations()
+    castPartition(split).inputPartition.preferredLocations().toImmutableArraySeq
   }
 }

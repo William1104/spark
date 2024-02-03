@@ -18,7 +18,7 @@
 package org.apache.spark.sql.execution.joins
 
 import org.apache.spark.sql.{DataFrame, Row}
-import org.apache.spark.sql.catalyst.expressions.{And, Expression, LessThan}
+import org.apache.spark.sql.catalyst.expressions.{And, EqualTo, Expression, LessThan}
 import org.apache.spark.sql.catalyst.optimizer.{BuildLeft, BuildRight}
 import org.apache.spark.sql.catalyst.planning.ExtractEquiJoinKeys
 import org.apache.spark.sql.catalyst.plans._
@@ -30,6 +30,8 @@ import org.apache.spark.sql.test.SharedSparkSession
 import org.apache.spark.sql.types.{DoubleType, IntegerType, StructType}
 
 class OuterJoinSuite extends SparkPlanTest with SharedSparkSession {
+
+  private val EnsureRequirements = new EnsureRequirements()
 
   private lazy val left = spark.createDataFrame(
     sparkContext.parallelize(Seq(
@@ -58,7 +60,7 @@ class OuterJoinSuite extends SparkPlanTest with SharedSparkSession {
     )), new StructType().add("c", IntegerType).add("d", DoubleType))
 
   private lazy val condition = {
-    And((left.col("a") === right.col("c")).expr,
+    And(EqualTo(left.col("a").expr, right.col("c").expr),
       LessThan(left.col("b").expr, right.col("d").expr))
   }
 
@@ -84,7 +86,7 @@ class OuterJoinSuite extends SparkPlanTest with SharedSparkSession {
     )), new StructType().add("c", IntegerType).add("d", DoubleType))
 
   private lazy val uniqueCondition = {
-    And((uniqueLeft.col("a") === uniqueRight.col("c")).expr,
+    And(EqualTo(uniqueLeft.col("a").expr, uniqueRight.col("c").expr),
       LessThan(uniqueLeft.col("b").expr, uniqueRight.col("d").expr))
   }
 
@@ -105,7 +107,7 @@ class OuterJoinSuite extends SparkPlanTest with SharedSparkSession {
     }
 
     testWithWholeStageCodegenOnAndOff(s"$testName using ShuffledHashJoin") { _ =>
-      extractJoinParts().foreach { case (_, leftKeys, rightKeys, boundCondition, _, _, _) =>
+      extractJoinParts().foreach { case (_, leftKeys, rightKeys, boundCondition, _, _, _, _) =>
         withSQLConf(SQLConf.SHUFFLE_PARTITIONS.key -> "1") {
           val buildSide = if (joinType == LeftOuter) BuildRight else BuildLeft
           checkAnswer2(leftRows, rightRows, (left: SparkPlan, right: SparkPlan) =>
@@ -125,7 +127,7 @@ class OuterJoinSuite extends SparkPlanTest with SharedSparkSession {
           case RightOuter => BuildLeft
           case _ => fail(s"Unsupported join type $joinType")
         }
-        extractJoinParts().foreach { case (_, leftKeys, rightKeys, boundCondition, _, _, _) =>
+        extractJoinParts().foreach { case (_, leftKeys, rightKeys, boundCondition, _, _, _, _) =>
           withSQLConf(SQLConf.SHUFFLE_PARTITIONS.key -> "1") {
             checkAnswer2(leftRows, rightRows, (left: SparkPlan, right: SparkPlan) =>
               BroadcastHashJoinExec(
@@ -137,8 +139,8 @@ class OuterJoinSuite extends SparkPlanTest with SharedSparkSession {
       }
     }
 
-    test(s"$testName using SortMergeJoin") {
-      extractJoinParts().foreach { case (_, leftKeys, rightKeys, boundCondition, _, _, _) =>
+    testWithWholeStageCodegenOnAndOff(s"$testName using SortMergeJoin") { _ =>
+      extractJoinParts().foreach { case (_, leftKeys, rightKeys, boundCondition, _, _, _, _) =>
         withSQLConf(SQLConf.SHUFFLE_PARTITIONS.key -> "1") {
           checkAnswer2(leftRows, rightRows, (left: SparkPlan, right: SparkPlan) =>
             EnsureRequirements.apply(
@@ -299,6 +301,27 @@ class OuterJoinSuite extends SparkPlanTest with SharedSparkSession {
       (null, null, 3, 2.0),
       (null, null, 4, 1.0),
       (5, 1.0, 5, 3.0),
+      (null, null, 7, 7.0)
+    )
+  )
+
+  testOuterJoin(
+    "full outer join with unique keys",
+    uniqueLeft,
+    uniqueRight,
+    FullOuter,
+    uniqueCondition,
+    Seq(
+      (null, null, null, null),
+      (null, null, null, null),
+      (1, 2.0, null, null),
+      (2, 1.0, 2, 3.0),
+      (3, 3.0, null, null),
+      (5, 1.0, 5, 3.0),
+      (6, 6.0, null, null),
+      (null, null, 0, 0.0),
+      (null, null, 3, 2.0),
+      (null, null, 4, 1.0),
       (null, null, 7, 7.0)
     )
   )

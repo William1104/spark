@@ -20,12 +20,14 @@ package org.apache.spark.sql
 import java.{lang => jl}
 import java.util.Locale
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 
 import org.apache.spark.annotation.Stable
 import org.apache.spark.sql.catalyst.expressions._
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.functions._
 import org.apache.spark.sql.types._
+import org.apache.spark.util.ArrayImplicits._
 
 /**
  * Functionality for working with missing data in `DataFrame`s.
@@ -58,7 +60,7 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
    *
    * @since 1.3.1
    */
-  def drop(cols: Array[String]): DataFrame = drop(cols.toSeq)
+  def drop(cols: Array[String]): DataFrame = drop(cols.toImmutableArraySeq)
 
   /**
    * (Scala-specific) Returns a new `DataFrame` that drops rows containing any null or NaN values
@@ -77,7 +79,7 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
    *
    * @since 1.3.1
    */
-  def drop(how: String, cols: Array[String]): DataFrame = drop(how, cols.toSeq)
+  def drop(how: String, cols: Array[String]): DataFrame = drop(how, cols.toImmutableArraySeq)
 
   /**
    * (Scala-specific) Returns a new `DataFrame` that drops rows containing null or NaN values
@@ -106,7 +108,8 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
    *
    * @since 1.3.1
    */
-  def drop(minNonNulls: Int, cols: Array[String]): DataFrame = drop(minNonNulls, cols.toSeq)
+  def drop(minNonNulls: Int, cols: Array[String]): DataFrame =
+    drop(minNonNulls, cols.toImmutableArraySeq)
 
   /**
    * (Scala-specific) Returns a new `DataFrame` that drops rows containing less than
@@ -144,7 +147,7 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
    *
    * @since 2.2.0
    */
-  def fill(value: Long, cols: Array[String]): DataFrame = fill(value, cols.toSeq)
+  def fill(value: Long, cols: Array[String]): DataFrame = fill(value, cols.toImmutableArraySeq)
 
   /**
    * Returns a new `DataFrame` that replaces null or NaN values in specified numeric columns.
@@ -152,7 +155,7 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
    *
    * @since 1.3.1
    */
-  def fill(value: Double, cols: Array[String]): DataFrame = fill(value, cols.toSeq)
+  def fill(value: Double, cols: Array[String]): DataFrame = fill(value, cols.toImmutableArraySeq)
 
   /**
    * (Scala-specific) Returns a new `DataFrame` that replaces null or NaN values in specified
@@ -177,7 +180,7 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
    *
    * @since 1.3.1
    */
-  def fill(value: String, cols: Array[String]): DataFrame = fill(value, cols.toSeq)
+  def fill(value: String, cols: Array[String]): DataFrame = fill(value, cols.toImmutableArraySeq)
 
   /**
    * (Scala-specific) Returns a new `DataFrame` that replaces null values in
@@ -208,7 +211,7 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
    *
    * @since 2.3.0
    */
-  def fill(value: Boolean, cols: Array[String]): DataFrame = fill(value, cols.toSeq)
+  def fill(value: Boolean, cols: Array[String]): DataFrame = fill(value, cols.toImmutableArraySeq)
 
 
   /**
@@ -300,7 +303,7 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
    * @since 1.3.1
    */
   def replace[T](cols: Array[String], replacement: java.util.Map[T, T]): DataFrame = {
-    replace(cols.toSeq, replacement.asScala.toMap)
+    replace(cols.toImmutableArraySeq, replacement.asScala.toMap)
   }
 
   /**
@@ -357,8 +360,7 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
       // Check column name exists
       val attr = df.resolve(colName) match {
         case a: Attribute => a
-        case _ => throw new UnsupportedOperationException(
-          s"Nested field ${colName} is not supported.")
+        case _ => throw QueryExecutionErrors.nestedFieldUnsupportedError(colName)
       }
       attr
     }
@@ -408,8 +410,7 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
       // Check column name exists
       val attr = df.resolve(colName) match {
         case a: Attribute => a
-        case _ => throw new UnsupportedOperationException(
-          s"Nested field ${colName} is not supported.")
+        case _ => throw QueryExecutionErrors.nestedFieldUnsupportedError(colName)
       }
       // Check data type
       replaceValue match {
@@ -502,6 +503,10 @@ final class DataFrameNaFunctions private[sql](df: DataFrame) {
     // only keep the row if it has at least `minNonNulls` non-null and non-NaN values.
     val predicate = AtLeastNNonNulls(minNonNulls, cols)
     df.filter(Column(predicate))
+  }
+
+  private[sql] def fillValue(value: Any, cols: Option[Seq[String]]): DataFrame = {
+    fillValue(value, cols.map(toAttributes).getOrElse(outputAttributes))
   }
 
   /**

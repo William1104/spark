@@ -40,8 +40,7 @@ different options to manage allocation, depending on the cluster manager.
 The simplest option, available on all cluster managers, is _static partitioning_ of resources. With
 this approach, each application is given a maximum amount of resources it can use and holds onto them
 for its whole duration. This is the approach used in Spark's [standalone](spark-standalone.html)
-and [YARN](running-on-yarn.html) modes, as well as the
-[coarse-grained Mesos mode](running-on-mesos.html#mesos-run-modes).
+and [YARN](running-on-yarn.html) modes.
 Resource allocation can be configured as follows, based on the cluster type:
 
 * **Standalone mode:** By default, applications submitted to the standalone mode cluster will run in
@@ -50,22 +49,11 @@ Resource allocation can be configured as follows, based on the cluster type:
   or change the default for applications that don't set this setting through `spark.deploy.defaultCores`.
   Finally, in addition to controlling cores, each application's `spark.executor.memory` setting controls
   its memory use.
-* **Mesos:** To use static partitioning on Mesos, set the `spark.mesos.coarse` configuration property to `true`,
-  and optionally set `spark.cores.max` to limit each application's resource share as in the standalone mode.
-  You should also set `spark.executor.memory` to control the executor memory.
 * **YARN:** The `--num-executors` option to the Spark YARN client controls how many executors it will allocate
   on the cluster (`spark.executor.instances` as configuration property), while `--executor-memory`
   (`spark.executor.memory` configuration property) and `--executor-cores` (`spark.executor.cores` configuration
   property) control the resources per executor. For more information, see the
   [YARN Spark Properties](running-on-yarn.html).
-
-A second option available on Mesos is _dynamic sharing_ of CPU cores. In this mode, each Spark application
-still has a fixed and independent memory allocation (set by `spark.executor.memory`), but when the
-application is not running tasks on a machine, other applications may run tasks on those cores. This mode
-is useful when you expect large numbers of not overly active applications, such as shell sessions from
-separate users. However, it comes with a risk of less predictable latency, because it may take a while for
-an application to gain back cores on one node when it has work to do. To use this mode, simply use a
-`mesos://` URL and set `spark.mesos.coarse` to false.
 
 Note that none of the modes currently provide memory sharing across applications. If you would like to share
 data this way, we recommend running a single server application that can serve multiple requests by querying
@@ -79,25 +67,28 @@ are no longer used and request them again later when there is demand. This featu
 useful if multiple applications share resources in your Spark cluster.
 
 This feature is disabled by default and available on all coarse-grained cluster managers, i.e.
-[standalone mode](spark-standalone.html), [YARN mode](running-on-yarn.html),
-[Mesos coarse-grained mode](running-on-mesos.html#mesos-run-modes) and [K8s mode](running-on-kubernetes.html).
+[standalone mode](spark-standalone.html), [YARN mode](running-on-yarn.html) and [K8s mode](running-on-kubernetes.html).
 
+
+### Caveats
+
+- In [standalone mode](spark-standalone.html), without explicitly setting `spark.executor.cores`, each executor will get all the available cores of a worker. In this case, when dynamic allocation enabled, spark will possibly acquire much more executors than expected. When you want to use dynamic allocation in [standalone mode](spark-standalone.html), you are recommended to explicitly set cores for each executor before the issue [SPARK-30299](https://issues.apache.org/jira/browse/SPARK-30299) got fixed.
 
 ### Configuration and Setup
 
-There are two ways for using this feature.
-First, your application must set both `spark.dynamicAllocation.enabled` and `spark.dynamicAllocation.shuffleTracking.enabled` to `true`.
-Second, your application must set both `spark.dynamicAllocation.enabled` and `spark.shuffle.service.enabled` to `true`
-after you set up an *external shuffle service* on each worker node in the same cluster.
-The purpose of the shuffle tracking or the external shuffle service is to allow executors to be removed
+There are several ways for using this feature.
+Regardless of which approach you choose, your application must set `spark.dynamicAllocation.enabled` to `true` first, additionally, 
+
+- your application must set `spark.shuffle.service.enabled` to `true` after you set up an *external shuffle service* on each worker node in the same cluster, or
+- your application must set `spark.dynamicAllocation.shuffleTracking.enabled` to `true`, or
+- your application must set both `spark.decommission.enabled` and `spark.storage.decommission.shuffleBlocks.enabled` to `true`, or
+- your application must configure `spark.shuffle.sort.io.plugin.class` to use a custom `ShuffleDataIO` who's `ShuffleDriverComponents` supports reliable storage.
+
+The purpose of the external shuffle service or the shuffle tracking or the `ShuffleDriverComponents` supports reliable storage is to allow executors to be removed
 without deleting shuffle files written by them (more detail described
 [below](job-scheduling.html#graceful-decommission-of-executors)). While it is simple to enable shuffle tracking, the way to set up the external shuffle service varies across cluster managers:
 
 In standalone mode, simply start your workers with `spark.shuffle.service.enabled` set to `true`.
-
-In Mesos coarse-grained mode, run `$SPARK_HOME/sbin/start-mesos-shuffle-service.sh` on all
-worker nodes with `spark.shuffle.service.enabled` set to `true`. For instance, you may do so
-through Marathon.
 
 In YARN mode, follow the instructions [here](running-on-yarn.html#configuring-the-external-shuffle-service).
 
@@ -142,13 +133,12 @@ an executor should not be idle if there are still pending tasks to be scheduled.
 
 ### Graceful Decommission of Executors
 
-Before dynamic allocation, a Spark executor exits either on failure or when the associated
-application has also exited. In both scenarios, all state associated with the executor is no
-longer needed and can be safely discarded. With dynamic allocation, however, the application
-is still running when an executor is explicitly removed. If the application attempts to access
-state stored in or written by the executor, it will have to perform a recompute the state. Thus,
-Spark needs a mechanism to decommission an executor gracefully by preserving its state before
-removing it.
+Before dynamic allocation, if a Spark executor exits when the associated application has also exited 
+then all state associated with the executor is no longer needed and can be safely discarded. 
+With dynamic allocation, however, the application is still running when an executor is explicitly 
+removed. If the application attempts to access state stored in or written by the executor, it will 
+have to perform a recompute the state. Thus, Spark needs a mechanism to decommission an executor 
+gracefully by preserving its state before removing it.
 
 This requirement is especially important for shuffles. During a shuffle, the Spark executor first
 writes its own map outputs locally to disk, and then acts as the server for those files when other
@@ -165,9 +155,12 @@ shuffle state written by an executor may continue to be served beyond the execut
 In addition to writing shuffle files, executors also cache data either on disk or in memory.
 When an executor is removed, however, all cached data will no longer be accessible.  To mitigate this,
 by default executors containing cached data are never removed.  You can configure this behavior with
-`spark.dynamicAllocation.cachedExecutorIdleTimeout`.  In future releases, the cached data may be
-preserved through an off-heap storage similar in spirit to how shuffle files are preserved through
-the external shuffle service.
+`spark.dynamicAllocation.cachedExecutorIdleTimeout`. When set `spark.shuffle.service.fetch.rdd.enabled`
+to `true`, Spark can use ExternalShuffleService for fetching disk persisted RDD blocks. In case of 
+dynamic allocation if this feature is enabled executors having only disk persisted blocks are considered
+idle after `spark.dynamicAllocation.executorIdleTimeout` and will be released accordingly. In future releases,
+the cached data may be preserved through an off-heap storage similar in spirit to how shuffle files are preserved 
+through the external shuffle service.
 
 # Scheduling Within an Application
 
@@ -189,6 +182,9 @@ of cluster resources. This means that short jobs submitted while a long job is r
 resources right away and still get good response times, without waiting for the long job to finish. This
 mode is best for multi-user settings.
 
+This feature is disabled by default and available on all coarse-grained cluster managers, i.e.
+[standalone mode](spark-standalone.html), [YARN mode](running-on-yarn.html),
+[K8s mode](running-on-kubernetes.html).
 To enable the fair scheduler, simply set the `spark.scheduler.mode` property to `FAIR` when configuring
 a SparkContext:
 
@@ -252,10 +248,13 @@ properties:
 
 The pool properties can be set by creating an XML file, similar to `conf/fairscheduler.xml.template`,
 and either putting a file named `fairscheduler.xml` on the classpath, or setting `spark.scheduler.allocation.file` property in your
-[SparkConf](configuration.html#spark-properties). The file path can either be a local file path or HDFS file path.
+[SparkConf](configuration.html#spark-properties). The file path respects the hadoop configuration and can either be a local file path or HDFS file path.
+
 
 {% highlight scala %}
-conf.set("spark.scheduler.allocation.file", "/path/to/file")
+// scheduler file at local
+conf.set("spark.scheduler.allocation.file", "file:///path/to/file")
+// scheduler file at hdfs
 conf.set("spark.scheduler.allocation.file", "hdfs:///path/to/file")
 {% endhighlight %}
 
@@ -298,10 +297,6 @@ in each corresponding JVM thread. Due to this limitation, it is unable to set a 
 via `sc.setJobGroup` in a separate PVM thread, which also disallows to cancel the job via `sc.cancelJobGroup`
 later.
 
-In order to synchronize PVM threads with JVM threads, you should set `PYSPARK_PIN_THREAD` environment variable
-to `true`. This pinned thread mode allows one PVM thread has one corresponding JVM thread. With this mode,
 `pyspark.InheritableThread` is recommended to use together for a PVM thread to inherit the inheritable attributes
  such as local properties in a JVM thread.
-
-Note that `PYSPARK_PIN_THREAD` is currently experimental and not recommended for use in production.
 

@@ -22,10 +22,12 @@ from pyspark.pandas.internal import (
     SPARK_DEFAULT_INDEX_NAME,
     SPARK_INDEX_NAME_FORMAT,
 )
-from pyspark.pandas.testing.utils import ReusedSQLTestCase, SQLTestUtils
+from pyspark.pandas.utils import spark_column_equals
+from pyspark.testing.pandasutils import PandasOnSparkTestCase
+from pyspark.testing.sqlutils import SQLTestUtils
 
 
-class InternalFrameTest(ReusedSQLTestCase, SQLTestUtils):
+class InternalFrameTestsMixin:
     def test_from_pandas(self):
         pdf = pd.DataFrame({"a": [1, 2, 3], "b": [4, 5, 6]})
 
@@ -36,8 +38,8 @@ class InternalFrameTest(ReusedSQLTestCase, SQLTestUtils):
         self.assert_eq(internal.index_names, [None])
         self.assert_eq(internal.column_labels, [("a",), ("b",)])
         self.assert_eq(internal.data_spark_column_names, ["a", "b"])
-        self.assertTrue(internal.spark_column_for(("a",))._jc.equals(sdf["a"]._jc))
-        self.assertTrue(internal.spark_column_for(("b",))._jc.equals(sdf["b"]._jc))
+        self.assertTrue(spark_column_equals(internal.spark_column_for(("a",)), sdf["a"]))
+        self.assertTrue(spark_column_equals(internal.spark_column_for(("b",)), sdf["b"]))
 
         self.assert_eq(internal.to_pandas_frame, pdf)
 
@@ -51,10 +53,24 @@ class InternalFrameTest(ReusedSQLTestCase, SQLTestUtils):
         self.assert_eq(internal.index_names, [None])
         self.assert_eq(internal.column_labels, [(0,), (1,)])
         self.assert_eq(internal.data_spark_column_names, ["0", "1"])
-        self.assertTrue(internal.spark_column_for((0,))._jc.equals(sdf["0"]._jc))
-        self.assertTrue(internal.spark_column_for((1,))._jc.equals(sdf["1"]._jc))
+        self.assertTrue(spark_column_equals(internal.spark_column_for((0,)), sdf["0"]))
+        self.assertTrue(spark_column_equals(internal.spark_column_for((1,)), sdf["1"]))
 
         self.assert_eq(internal.to_pandas_frame, pdf1)
+
+        # categorical column
+        pdf2 = pd.DataFrame({0: [1, 2, 3], 1: pd.Categorical([4, 5, 6])})
+        internal = InternalFrame.from_pandas(pdf2)
+        sdf = internal.spark_frame
+
+        self.assert_eq(internal.index_spark_column_names, [SPARK_DEFAULT_INDEX_NAME])
+        self.assert_eq(internal.index_names, [None])
+        self.assert_eq(internal.column_labels, [(0,), (1,)])
+        self.assert_eq(internal.data_spark_column_names, ["0", "1"])
+        self.assertTrue(spark_column_equals(internal.spark_column_for((0,)), sdf["0"]))
+        self.assertTrue(spark_column_equals(internal.spark_column_for((1,)), sdf["1"]))
+
+        self.assert_eq(internal.to_pandas_frame, pdf2)
 
         # multi-index
         pdf.set_index("a", append=True, inplace=True)
@@ -69,7 +85,7 @@ class InternalFrameTest(ReusedSQLTestCase, SQLTestUtils):
         self.assert_eq(internal.index_names, [None, ("a",)])
         self.assert_eq(internal.column_labels, [("b",)])
         self.assert_eq(internal.data_spark_column_names, ["b"])
-        self.assertTrue(internal.spark_column_for(("b",))._jc.equals(sdf["b"]._jc))
+        self.assertTrue(spark_column_equals(internal.spark_column_for(("b",)), sdf["b"]))
 
         self.assert_eq(internal.to_pandas_frame, pdf)
 
@@ -86,9 +102,13 @@ class InternalFrameTest(ReusedSQLTestCase, SQLTestUtils):
         self.assert_eq(internal.index_names, [None, ("a",)])
         self.assert_eq(internal.column_labels, [("x", "b")])
         self.assert_eq(internal.data_spark_column_names, ["(x, b)"])
-        self.assertTrue(internal.spark_column_for(("x", "b"))._jc.equals(sdf["(x, b)"]._jc))
+        self.assertTrue(spark_column_equals(internal.spark_column_for(("x", "b")), sdf["(x, b)"]))
 
         self.assert_eq(internal.to_pandas_frame, pdf)
+
+
+class InternalFrameTests(InternalFrameTestsMixin, PandasOnSparkTestCase, SQLTestUtils):
+    pass
 
 
 if __name__ == "__main__":
@@ -96,8 +116,9 @@ if __name__ == "__main__":
     from pyspark.pandas.tests.test_internal import *  # noqa: F401
 
     try:
-        import xmlrunner  # type: ignore[import]
-        testRunner = xmlrunner.XMLTestRunner(output='target/test-reports', verbosity=2)
+        import xmlrunner
+
+        testRunner = xmlrunner.XMLTestRunner(output="target/test-reports", verbosity=2)
     except ImportError:
         testRunner = None
     unittest.main(testRunner=testRunner, verbosity=2)

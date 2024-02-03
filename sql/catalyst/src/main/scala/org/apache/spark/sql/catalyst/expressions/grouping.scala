@@ -17,8 +17,10 @@
 
 package org.apache.spark.sql.catalyst.expressions
 
+import org.apache.spark.SparkUnsupportedOperationException
 import org.apache.spark.sql.catalyst.InternalRow
 import org.apache.spark.sql.catalyst.expressions.codegen.CodegenFallback
+import org.apache.spark.sql.catalyst.trees.TreePattern.{GROUPING_ANALYTICS, TreePattern}
 import org.apache.spark.sql.catalyst.trees.UnaryLike
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.types._
@@ -40,10 +42,11 @@ trait BaseGroupingSets extends Expression with CodegenFallback {
   // this should be replaced first
   override lazy val resolved: Boolean = false
 
-  override def dataType: DataType = throw new UnsupportedOperationException
+  override def dataType: DataType = throw SparkUnsupportedOperationException()
   override def foldable: Boolean = false
   override def nullable: Boolean = true
-  override def eval(input: InternalRow): Any = throw new UnsupportedOperationException
+  override def eval(input: InternalRow): Any = throw SparkUnsupportedOperationException()
+  final override val nodePatterns: Seq[TreePattern] = Seq(GROUPING_ANALYTICS)
 }
 
 object BaseGroupingSets {
@@ -149,10 +152,25 @@ case class GroupingSets(
   override def selectedGroupByExprs: Seq[Seq[Expression]] = groupingSets
   // Includes the `userGivenGroupByExprs` in the children, which will be included in the final
   // GROUP BY expressions, so that `SELECT c ... GROUP BY (a, b, c) GROUPING SETS (a, b)` works.
-  override def children: Seq[Expression] = flatGroupingSets ++ userGivenGroupByExprs
+  // Note that, we must put `userGivenGroupByExprs` at the beginning, to preserve the order of
+  // grouping columns specified by users. For example, GROUP BY (a, b) GROUPING SETS (b, a), the
+  // final grouping columns should be (a, b).
+  override def children: Seq[Expression] =
+    if (SQLConf.get.groupingIdWithAppendedUserGroupByEnabled) {
+      flatGroupingSets ++ userGivenGroupByExprs
+    } else {
+      userGivenGroupByExprs ++ flatGroupingSets
+    }
+
   override protected def withNewChildrenInternal(
       newChildren: IndexedSeq[Expression]): GroupingSets =
-    super.legacyWithNewChildren(newChildren).asInstanceOf[GroupingSets]
+    if (SQLConf.get.groupingIdWithAppendedUserGroupByEnabled) {
+      super.legacyWithNewChildren(newChildren).asInstanceOf[GroupingSets]
+    } else {
+      copy(
+        userGivenGroupByExprs = newChildren.take(userGivenGroupByExprs.length),
+        flatGroupingSets = newChildren.drop(userGivenGroupByExprs.length))
+    }
 }
 
 object GroupingSets {
@@ -195,6 +213,7 @@ case class Grouping(child: Expression) extends Expression with Unevaluable
     AttributeSet(VirtualColumn.groupingIdAttribute :: Nil)
   override def dataType: DataType = ByteType
   override def nullable: Boolean = false
+  final override val nodePatterns: Seq[TreePattern] = Seq(GROUPING_ANALYTICS)
   override protected def withNewChildInternal(newChild: Expression): Grouping =
     copy(child = newChild)
 }
@@ -236,6 +255,7 @@ case class GroupingID(groupByExprs: Seq[Expression]) extends Expression with Une
   override def dataType: DataType = GroupingID.dataType
   override def nullable: Boolean = false
   override def prettyName: String = "grouping_id"
+  final override val nodePatterns: Seq[TreePattern] = Seq(GROUPING_ANALYTICS)
   override protected def withNewChildrenInternal(newChildren: IndexedSeq[Expression]): GroupingID =
     copy(groupByExprs = newChildren)
 }
@@ -275,24 +295,5 @@ object GroupingAnalytics {
         Some(selectedGroupByExprs, BaseGroupingSets.distinctGroupByExprs(groups))
       }
     }
-  }
-}
-
-/**
- * A reference to an grouping expression in [[Aggregate]] node.
- *
- * @param ordinal The ordinal of the grouping expression in [[Aggregate]] that this expression
- *                refers to.
- * @param dataType The [[DataType]] of the referenced grouping expression.
- * @param nullable True if null is a valid value for the referenced grouping expression.
- */
-case class GroupingExprRef(
-    ordinal: Int,
-    dataType: DataType,
-    nullable: Boolean)
-  extends LeafExpression with Unevaluable {
-
-  override def stringArgs: Iterator[Any] = {
-    Iterator(ordinal)
   }
 }

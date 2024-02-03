@@ -17,11 +17,13 @@
 
 package org.apache.spark.sql.catalyst.rules
 
+import org.apache.spark.SparkException
 import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.QueryPlanningTracker
 import org.apache.spark.sql.catalyst.trees.TreeNode
 import org.apache.spark.sql.catalyst.util.DateTimeConstants.NANOS_PER_SECOND
 import org.apache.spark.sql.catalyst.util.sideBySide
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.util.Utils
 
@@ -61,7 +63,7 @@ class PlanChangeLogger[TreeType <: TreeNode[_]] extends Logging {
            """.stripMargin
         }
 
-        logBasedOnLevel(message)
+        logBasedOnLevel(message())
       }
     }
   }
@@ -79,7 +81,7 @@ class PlanChangeLogger[TreeType <: TreeNode[_]] extends Logging {
         }
       }
 
-      logBasedOnLevel(message)
+      logBasedOnLevel(message())
     }
   }
 
@@ -150,12 +152,14 @@ abstract class RuleExecutor[TreeType <: TreeNode[_]] extends Logging {
   protected val excludedOnceBatches: Set[String] = Set.empty
 
   /**
-   * Defines a check function that checks for structural integrity of the plan after the execution
-   * of each rule. For example, we can check whether a plan is still resolved after each rule in
-   * `Optimizer`, so we can catch rules that return invalid plans. The check function returns
-   * `false` if the given plan doesn't pass the structural integrity check.
+   * Defines a validate function that validates the plan changes after the execution of each rule,
+   * to make sure these rules make valid changes to the plan. For example, we can check whether
+   * a plan is still resolved after each rule in `Optimizer`, so that we can catch rules that
+   * turn the plan into unresolved.
    */
-  protected def isPlanIntegral(plan: TreeType): Boolean = true
+  protected def validatePlanChanges(
+      previousPlan: TreeType,
+      currentPlan: TreeType): Option[String] = None
 
   /**
    * Util method for checking whether a plan remains the same if re-optimized.
@@ -163,12 +167,8 @@ abstract class RuleExecutor[TreeType <: TreeNode[_]] extends Logging {
   private def checkBatchIdempotence(batch: Batch, plan: TreeType): Unit = {
     val reOptimized = batch.rules.foldLeft(plan) { case (p, rule) => rule(p) }
     if (!plan.fastEquals(reOptimized)) {
-      val message =
-        s"""
-           |Once strategy's idempotence is broken for batch ${batch.name}
-           |${sideBySide(plan.treeString, reOptimized.treeString).mkString("\n")}
-          """.stripMargin
-      throw new RuntimeException(message)
+      throw QueryExecutionErrors.onceStrategyIdempotenceIsBrokenForBatchError(
+        batch.name, plan, reOptimized)
     }
   }
 
@@ -194,11 +194,18 @@ abstract class RuleExecutor[TreeType <: TreeNode[_]] extends Logging {
     val tracker: Option[QueryPlanningTracker] = QueryPlanningTracker.get
     val beforeMetrics = RuleExecutor.getCurrentMetrics()
 
-    // Run the structural integrity checker against the initial input
-    if (!isPlanIntegral(plan)) {
-      val message = "The structural integrity of the input plan is broken in " +
-        s"${this.getClass.getName.stripSuffix("$")}."
-      throw new RuntimeException(message)
+    val enableValidation = SQLConf.get.getConf(SQLConf.PLAN_CHANGE_VALIDATION)
+    // Validate the initial input.
+    if (Utils.isTesting || enableValidation) {
+      validatePlanChanges(plan, plan) match {
+        case Some(msg) =>
+          val ruleExecutorName = this.getClass.getName.stripSuffix("$")
+          throw new SparkException(
+            errorClass = "PLAN_VALIDATION_FAILED_RULE_EXECUTOR",
+            messageParameters = Map("ruleExecutor" -> ruleExecutorName, "reason" -> msg),
+            cause = null)
+        case _ =>
+      }
     }
 
     batches.foreach { batch =>
@@ -220,19 +227,26 @@ abstract class RuleExecutor[TreeType <: TreeNode[_]] extends Logging {
               queryExecutionMetrics.incNumEffectiveExecution(rule.ruleName)
               queryExecutionMetrics.incTimeEffectiveExecutionBy(rule.ruleName, runTime)
               planChangeLogger.logRule(rule.ruleName, plan, result)
+              // Run the plan changes validation after each rule.
+              if (Utils.isTesting || enableValidation) {
+                validatePlanChanges(plan, result) match {
+                  case Some(msg) =>
+                    throw new SparkException(
+                      errorClass = "PLAN_VALIDATION_FAILED_RULE_IN_BATCH",
+                      messageParameters = Map(
+                        "rule" -> rule.ruleName,
+                        "batch" -> batch.name,
+                        "reason" -> msg),
+                      cause = null)
+                  case _ =>
+                }
+              }
             }
             queryExecutionMetrics.incExecutionTimeBy(rule.ruleName, runTime)
             queryExecutionMetrics.incNumExecution(rule.ruleName)
 
             // Record timing information using QueryPlanningTracker
             tracker.foreach(_.recordRuleInvocation(rule.ruleName, runTime, effective))
-
-            // Run the structural integrity checker against the plan after each rule.
-            if (effective && !isPlanIntegral(result)) {
-              val message = s"After applying rule ${rule.ruleName} in batch ${batch.name}, " +
-                "the structural integrity of the plan is broken."
-              throw new RuntimeException(message)
-            }
 
             result
         }

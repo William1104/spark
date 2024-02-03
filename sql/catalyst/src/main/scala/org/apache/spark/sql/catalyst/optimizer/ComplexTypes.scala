@@ -20,13 +20,15 @@ package org.apache.spark.sql.catalyst.optimizer
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.logical.LogicalPlan
 import org.apache.spark.sql.catalyst.rules.Rule
+import org.apache.spark.sql.catalyst.trees.TreePattern._
 
 /**
  * Simplify redundant [[CreateNamedStruct]], [[CreateArray]] and [[CreateMap]] expressions.
  */
 object SimplifyExtractValueOps extends Rule[LogicalPlan] {
-  override def apply(plan: LogicalPlan): LogicalPlan = plan transform {
-    case p => p.transformExpressionsUp {
+  override def apply(plan: LogicalPlan): LogicalPlan = plan.transformWithPruning(
+    _.containsPattern(EXTRACT_VALUE), ruleId) {
+    case p => p.transformExpressionsUpWithPruning(_.containsPattern(EXTRACT_VALUE), ruleId) {
       // Remove redundant field extraction.
       case GetStructField(createNamedStruct: CreateNamedStruct, ordinal, _) =>
         createNamedStruct.valExprs(ordinal)
@@ -61,7 +63,7 @@ object SimplifyExtractValueOps extends Rule[LogicalPlan] {
           // out of bounds, mimic the runtime behavior and return null
           Literal(null, ga.dataType)
         }
-      case GetMapValue(CreateMap(elems, _), key, _) => CaseKeyWhen(key, elems)
+      case GetMapValue(CreateMap(elems, _), key) => CaseKeyWhen(key, elems)
     }
   }
 }

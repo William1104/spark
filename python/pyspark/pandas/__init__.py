@@ -14,11 +14,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+
+"""
+.. versionadded:: 3.2.0
+    pandas API on Spark
+"""
+
 import os
 import sys
-from distutils.version import LooseVersion
 import warnings
+from typing import Any
 
+from pyspark.pandas.missing.general_functions import MissingPandasLikeGeneralFunctions
+from pyspark.pandas.missing.scalars import MissingPandasLikeScalars
 from pyspark.sql.pandas.utils import require_minimum_pandas_version, require_minimum_pyarrow_version
 
 try:
@@ -31,41 +39,8 @@ except ImportError as e:
     else:
         raise
 
-from pyspark.pandas.version import __version__  # noqa: F401
-
-
-def assert_python_version():
-    major = 3
-    minor = 5
-    deprecated_version = (major, minor)
-    min_supported_version = (major, minor + 1)
-
-    if sys.version_info[:2] <= deprecated_version:
-        warnings.warn(
-            "pandas-on-Spark support for Python {dep_ver} is deprecated and will be dropped in "
-            "the future release. At that point, existing Python {dep_ver} workflows "
-            "that use pandas-on-Spark will continue to work without modification, but "
-            "Python {dep_ver} users will no longer get access to the latest pandas-on-Spark "
-            "features and bugfixes. We recommend that you upgrade to Python {min_ver} or "
-            "newer.".format(
-                dep_ver=".".join(map(str, deprecated_version)),
-                min_ver=".".join(map(str, min_supported_version)),
-            ),
-            FutureWarning,
-        )
-
-
-assert_python_version()
-
-import pyarrow
-
-if (
-    LooseVersion(pyarrow.__version__) >= LooseVersion("2.0.0")
-    and "PYARROW_IGNORE_TIMEZONE" not in os.environ
-):
-    import logging
-
-    logging.warning(
+if "PYARROW_IGNORE_TIMEZONE" not in os.environ:
+    warnings.warn(
         "'PYARROW_IGNORE_TIMEZONE' environment variable was not set. It is required to "
         "set this environment variable to '1' in both driver and executor sides if you use "
         "pyarrow>=2.0.0. "
@@ -79,7 +54,7 @@ from pyspark.pandas.indexes.base import Index
 from pyspark.pandas.indexes.category import CategoricalIndex
 from pyspark.pandas.indexes.datetimes import DatetimeIndex
 from pyspark.pandas.indexes.multi import MultiIndex
-from pyspark.pandas.indexes.numeric import Float64Index, Int64Index
+from pyspark.pandas.indexes.timedelta import TimedeltaIndex
 from pyspark.pandas.series import Series
 from pyspark.pandas.groupby import NamedAgg
 
@@ -94,10 +69,9 @@ __all__ = [  # noqa: F405
     "Series",
     "Index",
     "MultiIndex",
-    "Int64Index",
-    "Float64Index",
     "CategoricalIndex",
     "DatetimeIndex",
+    "TimedeltaIndex",
     "sql",
     "range",
     "concat",
@@ -114,12 +88,12 @@ __all__ = [  # noqa: F405
 ]
 
 
-def _auto_patch_spark():
+def _auto_patch_spark() -> None:
     import os
     import logging
 
-    # Attach a usage logger.
-    logger_module = os.getenv("KOALAS_USAGE_LOGGER", "")
+    # Attach a usage logger. 'KOALAS_USAGE_LOGGER' is legacy, and it's for compatibility.
+    logger_module = os.getenv("PYSPARK_PANDAS_USAGE_LOGGER", os.getenv("KOALAS_USAGE_LOGGER", ""))
     if logger_module != "":
         try:
             from pyspark.pandas import usage_logging
@@ -133,21 +107,12 @@ def _auto_patch_spark():
                 )
             )
 
-    # Autopatching is on by default.
-    x = os.getenv("SPARK_KOALAS_AUTOPATCH", "true")
-    if x.lower() in ("true", "1", "enabled"):
-        logger = logging.getLogger("spark")
-        logger.info(
-            "Patching spark automatically. You can disable it by setting "
-            "SPARK_KOALAS_AUTOPATCH=false in your environment"
-        )
 
-        from pyspark.sql import dataframe as df
-
-        df.DataFrame.to_koalas = DataFrame.to_koalas
+_frame_has_class_getitem = False
+_series_has_class_getitem = False
 
 
-def _auto_patch_pandas():
+def _auto_patch_pandas() -> None:
     import pandas as pd
 
     # In order to use it in test cases.
@@ -157,13 +122,16 @@ def _auto_patch_pandas():
     _frame_has_class_getitem = hasattr(pd.DataFrame, "__class_getitem__")
     _series_has_class_getitem = hasattr(pd.Series, "__class_getitem__")
 
-    if sys.version_info >= (3, 7):
-        # Just in case pandas implements '__class_getitem__' later.
-        if not _frame_has_class_getitem:
-            pd.DataFrame.__class_getitem__ = lambda params: DataFrame.__class_getitem__(params)
+    # Just in case pandas implements '__class_getitem__' later.
+    if not _frame_has_class_getitem:
+        pd.DataFrame.__class_getitem__ = (  # type: ignore[attr-defined]
+            lambda params: DataFrame.__class_getitem__(params)
+        )
 
-        if not _series_has_class_getitem:
-            pd.Series.__class_getitem__ = lambda params: Series.__class_getitem__(params)
+    if not _series_has_class_getitem:
+        pd.Series.__class_getitem__ = (  # type: ignore[attr-defined]
+            lambda params: Series.__class_getitem__(params)
+        )
 
 
 _auto_patch_spark()
@@ -171,5 +139,16 @@ _auto_patch_pandas()
 
 # Import after the usage logger is attached.
 from pyspark.pandas.config import get_option, options, option_context, reset_option, set_option
-from pyspark.pandas.namespace import *  # F405
-from pyspark.pandas.sql_processor import sql
+from pyspark.pandas.namespace import *  # noqa: F403
+from pyspark.pandas.sql_formatter import sql
+
+
+def __getattr__(key: str) -> Any:
+    if key.startswith("__"):
+        raise AttributeError(key)
+    if hasattr(MissingPandasLikeScalars, key):
+        raise getattr(MissingPandasLikeScalars, key)
+    if hasattr(MissingPandasLikeGeneralFunctions, key):
+        return getattr(MissingPandasLikeGeneralFunctions, key)
+    else:
+        raise AttributeError("module 'pyspark.pandas' has no attribute '%s'" % (key))

@@ -68,7 +68,7 @@ test_that("createDataFrame/collect Arrow optimization - type specification", {
     callJMethod(conf, "set", "spark.sql.execution.arrow.sparkr.enabled", arrowEnabled)
   })
 
-  expect_equal(collect(createDataFrame(rdf)), expected)
+  expect_true(all(collect(createDataFrame(rdf)) == expected))
 })
 
 test_that("dapply() Arrow optimization", {
@@ -140,7 +140,7 @@ test_that("dapply() Arrow optimization - type specification (date and timestamp)
                               b = as.POSIXct("1990-02-24 12:34:56"))))
   df <- createDataFrame(rdf)
   ret <- dapply(df, function(rdf) { rdf }, schema(df))
-  expect_equal(collect(ret), rdf)
+  expect_true(all(collect(ret) == rdf))
 })
 
 test_that("gapply() Arrow optimization", {
@@ -226,7 +226,7 @@ test_that("gapply() Arrow optimization - type specification (date and timestamp)
   ret <- gapply(df,
                 "a",
                 function(key, grouped) { grouped }, schema(df))
-  expect_equal(collect(ret), rdf)
+  expect_true(all(collect(ret) == rdf))
 })
 
 test_that("Arrow optimization - unsupported types", {
@@ -247,6 +247,21 @@ test_that("SPARK-32478: gapply() Arrow optimization - error message for schema m
   expect_error(
     count(gapply(df, "a", function(key, group) { group }, structType("a int, b int"))),
     "expected IntegerType, IntegerType, got IntegerType, StringType")
+})
+
+test_that("SPARK-43789: Automatically pick the number of partitions based on Arrow batch size", {
+  skip_if_not_installed("arrow")
+
+  conf <- callJMethod(sparkSession, "conf")
+  maxRecordsPerBatch <- sparkR.conf("spark.sql.execution.arrow.maxRecordsPerBatch")[[1]]
+
+  callJMethod(conf, "set", "spark.sql.execution.arrow.maxRecordsPerBatch", "10")
+  tryCatch({
+    expect_equal(getNumPartitionsRDD(toRDD(createDataFrame(mtcars))), 4)
+  },
+  finally = {
+    callJMethod(conf, "set", "spark.sql.execution.arrow.maxRecordsPerBatch", maxRecordsPerBatch)
+  })
 })
 
 sparkR.session.stop()

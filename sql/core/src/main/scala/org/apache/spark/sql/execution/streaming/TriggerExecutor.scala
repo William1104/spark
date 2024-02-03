@@ -31,12 +31,22 @@ trait TriggerExecutor {
 /**
  * A trigger executor that runs a single batch only, then terminates.
  */
-case class OneTimeExecutor() extends TriggerExecutor {
+case class SingleBatchExecutor() extends TriggerExecutor {
 
   /**
    * Execute a single batch using `batchRunner`.
    */
   override def execute(batchRunner: () => Boolean): Unit = batchRunner()
+}
+
+/**
+ * A trigger executor that runs multiple batches then terminates.
+ */
+case class MultiBatchExecutor() extends TriggerExecutor {
+  /**
+   * Execute multiple batches using `batchRunner`
+   */
+  override def execute(batchRunner: () => Boolean): Unit = while (batchRunner()) {}
 }
 
 /**
@@ -52,11 +62,11 @@ case class ProcessingTimeExecutor(
 
   override def execute(triggerHandler: () => Boolean): Unit = {
     while (true) {
-      val triggerTimeMs = clock.getTimeMillis
+      val triggerTimeMs = clock.getTimeMillis()
       val nextTriggerTimeMs = nextBatchTime(triggerTimeMs)
       val terminated = !triggerHandler()
       if (intervalMs > 0) {
-        val batchElapsedTimeMs = clock.getTimeMillis - triggerTimeMs
+        val batchElapsedTimeMs = clock.getTimeMillis() - triggerTimeMs
         if (batchElapsedTimeMs > intervalMs) {
           notifyBatchFallingBehind(batchElapsedTimeMs)
         }

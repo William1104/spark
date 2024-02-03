@@ -19,7 +19,6 @@ package org.apache.spark.mllib.tree.model
 
 import scala.collection.mutable
 
-import com.github.fommil.netlib.BLAS.{getInstance => blas}
 import org.json4s._
 import org.json4s.JsonDSL._
 import org.json4s.jackson.JsonMethods._
@@ -28,6 +27,7 @@ import org.apache.spark.SparkContext
 import org.apache.spark.annotation.Since
 import org.apache.spark.api.java.JavaRDD
 import org.apache.spark.internal.Logging
+import org.apache.spark.ml.linalg.BLAS
 import org.apache.spark.mllib.linalg.Vector
 import org.apache.spark.mllib.regression.LabeledPoint
 import org.apache.spark.mllib.tree.configuration.Algo
@@ -37,6 +37,7 @@ import org.apache.spark.mllib.tree.loss.Loss
 import org.apache.spark.mllib.util.{Loader, Saveable}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.util.ArrayImplicits._
 import org.apache.spark.util.Utils
 
 /**
@@ -280,7 +281,7 @@ private[tree] sealed class TreeEnsembleModel(
    */
   private def predictBySumming(features: Vector): Double = {
     val treePredictions = trees.map(_.predict(features))
-    blas.ddot(numTrees, treePredictions, 1, treeWeights, 1)
+    BLAS.nativeBLAS.ddot(numTrees, treePredictions, 1, treeWeights, 1)
   }
 
   /**
@@ -428,9 +429,10 @@ private[tree] object TreeEnsembleModel extends Logging {
       sc.parallelize(Seq(metadata), 1).saveAsTextFile(Loader.metadataPath(path))
 
       // Create Parquet data.
-      val dataRDD = sc.parallelize(model.trees.zipWithIndex).flatMap { case (tree, treeId) =>
-        tree.topNode.subtreeIterator.toSeq.map(node => NodeData(treeId, node))
-      }
+      val dataRDD = sc.parallelize(model.trees.zipWithIndex.toImmutableArraySeq)
+        .flatMap { case (tree, treeId) =>
+          tree.topNode.subtreeIterator.toSeq.map(node => NodeData(treeId, node))
+        }
       spark.createDataFrame(dataRDD).write.parquet(Loader.dataPath(path))
     }
 
@@ -438,7 +440,7 @@ private[tree] object TreeEnsembleModel extends Logging {
      * Read metadata from the loaded JSON metadata.
      */
     def readMetadata(metadata: JValue): Metadata = {
-      implicit val formats = DefaultFormats
+      implicit val formats: Formats = DefaultFormats
       (metadata \ "metadata").extract[Metadata]
     }
 

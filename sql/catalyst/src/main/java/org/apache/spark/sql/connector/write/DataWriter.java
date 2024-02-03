@@ -19,8 +19,10 @@ package org.apache.spark.sql.connector.write;
 
 import java.io.Closeable;
 import java.io.IOException;
+import java.util.Iterator;
 
 import org.apache.spark.annotation.Evolving;
+import org.apache.spark.sql.connector.metric.CustomTaskMetric;
 
 /**
  * A data writer returned by {@link DataWriterFactory#createWriter(int, long)} and is
@@ -74,6 +76,23 @@ public interface DataWriter<T> extends Closeable {
   void write(T record) throws IOException;
 
   /**
+   * Writes all records provided by the given iterator. By default, it calls the {@link #write}
+   * method for each record in the iterator.
+   * <p>
+   * If this method fails (by throwing an exception), {@link #abort()} will be called and this
+   * data writer is considered to have been failed.
+   *
+   * @throws IOException if failure happens during disk/network IO like writing files.
+   *
+   * @since 4.0.0
+   */
+  default void writeAll(Iterator<T> records) throws IOException {
+    while (records.hasNext()) {
+      write(records.next());
+    }
+  }
+
+  /**
    * Commits this writer after all records are written successfully, returns a commit message which
    * will be sent back to driver side and passed to
    * {@link BatchWrite#commit(WriterCommitMessage[])}.
@@ -104,4 +123,12 @@ public interface DataWriter<T> extends Closeable {
    * @throws IOException if failure happens during disk/network IO like writing files.
    */
   void abort() throws IOException;
+
+  /**
+   * Returns an array of custom task metrics. By default it returns empty array. Note that it is
+   * not recommended to put heavy logic in this method as it may affect writing performance.
+   */
+  default CustomTaskMetric[] currentMetricsValues() {
+    return new CustomTaskMetric[]{};
+  }
 }

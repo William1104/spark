@@ -24,7 +24,6 @@ import org.apache.hadoop.hive.metastore.api.FieldSchema
 import org.apache.hadoop.hive.serde.serdeConstants
 
 import org.apache.spark.SparkFunSuite
-import org.apache.spark.internal.Logging
 import org.apache.spark.sql.catalyst.dsl.expressions._
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.catalyst.plans.PlanTest
@@ -36,8 +35,8 @@ import org.apache.spark.unsafe.types.UTF8String
  * A set of tests for the filter conversion logic used when pushing partition pruning into the
  * metastore
  */
-class FiltersSuite extends SparkFunSuite with Logging with PlanTest {
-  private val shim = new Shim_v0_13
+class FiltersSuite extends SparkFunSuite with PlanTest {
+  private val shim = new Shim_v2_0
 
   private val testTable = new org.apache.hadoop.hive.ql.metadata.Table("default", "test")
   private val varCharCol = new FieldSchema()
@@ -67,17 +66,17 @@ class FiltersSuite extends SparkFunSuite with Logging with PlanTest {
 
   filterTest("date filter",
     (a("datecol", DateType) === Literal(Date.valueOf("2019-01-01"))) :: Nil,
-    "datecol = 2019-01-01")
+    "datecol = \"2019-01-01\"")
 
   filterTest("date filter with IN predicate",
     (a("datecol", DateType) in
       (Literal(Date.valueOf("2019-01-01")), Literal(Date.valueOf("2019-01-07")))) :: Nil,
-    "(datecol = 2019-01-01 or datecol = 2019-01-07)")
+    "(datecol = \"2019-01-01\" or datecol = \"2019-01-07\")")
 
   filterTest("date and string filter",
     (Literal(Date.valueOf("2019-01-01")) === a("datecol", DateType)) ::
       (Literal("a") === a("strcol", IntegerType)) :: Nil,
-    "2019-01-01 = datecol and \"a\" = strcol")
+    "\"2019-01-01\" = datecol and \"a\" = strcol")
 
   filterTest("date filter with null",
     (a("datecol", DateType) ===  Literal(null)) :: Nil,
@@ -106,7 +105,7 @@ class FiltersSuite extends SparkFunSuite with Logging with PlanTest {
 
   filterTest("NOT: date filter",
     (a("datecol", DateType) =!= Literal(Date.valueOf("2019-01-01"))) :: Nil,
-    "datecol != 2019-01-01")
+    "datecol != \"2019-01-01\"")
 
   filterTest("not-in, string filter",
     (Not(In(a("strcol", StringType), Seq(Literal("a"), Literal("b"))))) :: Nil,
@@ -119,7 +118,7 @@ class FiltersSuite extends SparkFunSuite with Logging with PlanTest {
   filterTest("not-in, date filter",
     (Not(In(a("datecol", DateType),
       Seq(Literal(Date.valueOf("2021-01-01")), Literal(Date.valueOf("2021-01-02")))))) :: Nil,
-    """(datecol != 2021-01-01 and datecol != 2021-01-02)""")
+    """(datecol != "2021-01-01" and datecol != "2021-01-02")""")
 
   filterTest("not-in, date filter with null",
     (Not(In(a("datecol", DateType),
@@ -140,7 +139,7 @@ class FiltersSuite extends SparkFunSuite with Logging with PlanTest {
     (Not(InSet(a("datecol", DateType),
       Set(Literal(Date.valueOf("2020-01-01")).eval(),
         Literal(Date.valueOf("2020-01-02")).eval())))) :: Nil,
-    """(datecol != 2020-01-01 and datecol != 2020-01-02)""")
+    """(datecol != "2020-01-01" and datecol != "2020-01-02")""")
 
   filterTest("not-inset, date filter with null",
     (Not(InSet(a("datecol", DateType),
@@ -162,7 +161,7 @@ class FiltersSuite extends SparkFunSuite with Logging with PlanTest {
   private def filterTest(name: String, filters: Seq[Expression], result: String) = {
     test(name) {
       withSQLConf(SQLConf.ADVANCED_PARTITION_PREDICATE_PUSHDOWN.key -> "true") {
-        val converted = shim.convertFilters(testTable, filters, conf.sessionLocalTimeZone)
+        val converted = shim.convertFilters(testTable, filters)
         if (converted != result) {
           fail(s"Expected ${filters.mkString(",")} to convert to '$result' but got '$converted'")
         }
@@ -177,7 +176,7 @@ class FiltersSuite extends SparkFunSuite with Logging with PlanTest {
         val filters =
           (Literal(1) === a("intcol", IntegerType) ||
             Literal(2) === a("intcol", IntegerType)) :: Nil
-        val converted = shim.convertFilters(testTable, filters, conf.sessionLocalTimeZone)
+        val converted = shim.convertFilters(testTable, filters)
         if (enabled) {
           assert(converted == "(1 = intcol or 2 = intcol)")
         } else {
@@ -189,7 +188,7 @@ class FiltersSuite extends SparkFunSuite with Logging with PlanTest {
 
   test("SPARK-33416: Avoid Hive metastore stack overflow when InSet predicate have many values") {
     def checkConverted(inSet: InSet, result: String): Unit = {
-      assert(shim.convertFilters(testTable, inSet :: Nil, conf.sessionLocalTimeZone) == result)
+      assert(shim.convertFilters(testTable, inSet :: Nil) == result)
     }
 
     withSQLConf(SQLConf.HIVE_METASTORE_PARTITION_PRUNING_INSET_THRESHOLD.key -> "15") {
@@ -216,14 +215,14 @@ class FiltersSuite extends SparkFunSuite with Logging with PlanTest {
       checkConverted(
         InSet(a("datecol", DateType),
           Range(1, 20).map(d => Literal(d, DateType).eval(EmptyRow)).toSet),
-        "(datecol >= 1970-01-02 and datecol <= 1970-01-20)")
+        "(datecol >= \"1970-01-02\" and datecol <= \"1970-01-20\")")
     }
   }
 
   test("SPARK-34515: Fix NPE if InSet contains null value during getPartitionsByFilter") {
     withSQLConf(SQLConf.HIVE_METASTORE_PARTITION_PRUNING_INSET_THRESHOLD.key -> "2") {
       val filter = InSet(a("p", IntegerType), Set(null, 1, 2))
-      val converted = shim.convertFilters(testTable, Seq(filter), conf.sessionLocalTimeZone)
+      val converted = shim.convertFilters(testTable, Seq(filter))
       assert(converted == "(p >= 1 and p <= 2)")
     }
   }
@@ -231,7 +230,7 @@ class FiltersSuite extends SparkFunSuite with Logging with PlanTest {
   test("Don't push not inset if it's values exceeds the threshold") {
     withSQLConf(SQLConf.HIVE_METASTORE_PARTITION_PRUNING_INSET_THRESHOLD.key -> "2") {
       val filter = Not(InSet(a("p", IntegerType), Set(1, 2, 3)))
-      val converted = shim.convertFilters(testTable, Seq(filter), conf.sessionLocalTimeZone)
+      val converted = shim.convertFilters(testTable, Seq(filter))
       assert(converted.isEmpty)
     }
   }
@@ -239,15 +238,15 @@ class FiltersSuite extends SparkFunSuite with Logging with PlanTest {
   test("SPARK-34538: Skip InSet null value during push filter to Hive metastore") {
     withSQLConf(SQLConf.HIVE_METASTORE_PARTITION_PRUNING_INSET_THRESHOLD.key -> "3") {
       val intFilter = InSet(a("p", IntegerType), Set(null, 1, 2))
-      val intConverted = shim.convertFilters(testTable, Seq(intFilter), conf.sessionLocalTimeZone)
+      val intConverted = shim.convertFilters(testTable, Seq(intFilter))
       assert(intConverted == "(p = 1 or p = 2)")
     }
 
     withSQLConf(SQLConf.HIVE_METASTORE_PARTITION_PRUNING_INSET_THRESHOLD.key -> "3") {
       val dateFilter = InSet(a("p", DateType), Set(null,
         Literal(Date.valueOf("2020-01-01")).eval(), Literal(Date.valueOf("2021-01-01")).eval()))
-      val dateConverted = shim.convertFilters(testTable, Seq(dateFilter), conf.sessionLocalTimeZone)
-      assert(dateConverted == "(p = 2020-01-01 or p = 2021-01-01)")
+      val dateConverted = shim.convertFilters(testTable, Seq(dateFilter))
+      assert(dateConverted == "(p = \"2020-01-01\" or p = \"2021-01-01\")")
     }
   }
 

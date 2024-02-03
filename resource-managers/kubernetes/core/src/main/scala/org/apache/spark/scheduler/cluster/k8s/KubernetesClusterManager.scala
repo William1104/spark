@@ -19,47 +19,72 @@ package org.apache.spark.scheduler.cluster.k8s
 import java.io.File
 
 import io.fabric8.kubernetes.client.Config
+import io.fabric8.kubernetes.client.KubernetesClient
 
-import org.apache.spark.SparkContext
+import org.apache.spark.{SparkConf, SparkContext, SparkMasterRegex}
 import org.apache.spark.deploy.k8s.{KubernetesConf, KubernetesUtils, SparkKubernetesClientFactory}
 import org.apache.spark.deploy.k8s.Config._
 import org.apache.spark.deploy.k8s.Constants.DEFAULT_EXECUTOR_CONTAINER_NAME
 import org.apache.spark.internal.Logging
+import org.apache.spark.internal.config.TASK_MAX_FAILURES
 import org.apache.spark.scheduler.{ExternalClusterManager, SchedulerBackend, TaskScheduler, TaskSchedulerImpl}
-import org.apache.spark.util.{SystemClock, ThreadUtils}
+import org.apache.spark.scheduler.local.LocalSchedulerBackend
+import org.apache.spark.util.{Clock, SystemClock, ThreadUtils, Utils}
 
 private[spark] class KubernetesClusterManager extends ExternalClusterManager with Logging {
+  import SparkMasterRegex._
 
   override def canCreate(masterURL: String): Boolean = masterURL.startsWith("k8s")
 
+  private def isLocal(conf: SparkConf): Boolean =
+    conf.get(KUBERNETES_DRIVER_MASTER_URL).startsWith("local")
+
   override def createTaskScheduler(sc: SparkContext, masterURL: String): TaskScheduler = {
-    new TaskSchedulerImpl(sc)
+    val maxTaskFailures = sc.conf.get(KUBERNETES_DRIVER_MASTER_URL) match {
+      case "local" | LOCAL_N_REGEX(_) => 1
+      case LOCAL_N_FAILURES_REGEX(_, maxFailures) => maxFailures.toInt
+      case _ => sc.conf.get(TASK_MAX_FAILURES)
+    }
+    new TaskSchedulerImpl(sc, maxTaskFailures, isLocal(sc.conf))
   }
 
   override def createSchedulerBackend(
       sc: SparkContext,
       masterURL: String,
       scheduler: TaskScheduler): SchedulerBackend = {
+    if (isLocal(sc.conf)) {
+      def localCpuCount: Int = Runtime.getRuntime.availableProcessors()
+      val threadCount = sc.conf.get(KUBERNETES_DRIVER_MASTER_URL) match {
+        case LOCAL_N_REGEX(threads) =>
+          if (threads == "*") localCpuCount else threads.toInt
+        case LOCAL_N_FAILURES_REGEX(threads, _) =>
+          if (threads == "*") localCpuCount else threads.toInt
+        case _ => 1
+      }
+      logInfo(s"Running Spark with ${sc.conf.get(KUBERNETES_DRIVER_MASTER_URL)}")
+      val schedulerImpl = scheduler.asInstanceOf[TaskSchedulerImpl]
+      // KubernetesClusterSchedulerBackend respects `spark.app.id` while LocalSchedulerBackend
+      // does not. Propagate `spark.app.id` via `spark.test.appId` to match the behavior.
+      val conf = sc.conf.getOption("spark.app.id").map(sc.conf.set("spark.test.appId", _))
+      val backend = new LocalSchedulerBackend(conf.getOrElse(sc.conf), schedulerImpl, threadCount)
+      schedulerImpl.initialize(backend)
+      return backend
+    }
     val wasSparkSubmittedInClusterMode = sc.conf.get(KUBERNETES_DRIVER_SUBMIT_CHECK)
     val (authConfPrefix,
       apiServerUri,
-      defaultServiceAccountToken,
       defaultServiceAccountCaCrt) = if (wasSparkSubmittedInClusterMode) {
       require(sc.conf.get(KUBERNETES_DRIVER_POD_NAME).isDefined,
         "If the application is deployed using spark-submit in cluster mode, the driver pod name " +
           "must be provided.")
-      val serviceAccountToken =
-        Some(new File(Config.KUBERNETES_SERVICE_ACCOUNT_TOKEN_PATH)).filter(_.exists)
       val serviceAccountCaCrt =
         Some(new File(Config.KUBERNETES_SERVICE_ACCOUNT_CA_CRT_PATH)).filter(_.exists)
       (KUBERNETES_AUTH_DRIVER_MOUNTED_CONF_PREFIX,
         sc.conf.get(KUBERNETES_DRIVER_MASTER_URL),
-        serviceAccountToken,
         serviceAccountCaCrt)
     } else {
       (KUBERNETES_AUTH_CLIENT_MODE_PREFIX,
         KubernetesUtils.parseMasterUrl(masterURL),
-        None,
         None)
     }
 
@@ -80,7 +105,6 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
       authConfPrefix,
       SparkKubernetesClientFactory.ClientType.Driver,
       sc.conf,
-      defaultServiceAccountToken,
       defaultServiceAccountCaCrt)
 
     if (sc.conf.get(KUBERNETES_EXECUTOR_PODTEMPLATE_FILE).isDefined) {
@@ -102,24 +126,19 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
     val subscribersExecutor = ThreadUtils
       .newDaemonThreadPoolScheduledExecutor(
         "kubernetes-executor-snapshots-subscribers", 2)
-    val snapshotsStore = new ExecutorPodsSnapshotsStoreImpl(subscribersExecutor)
+    val snapshotsStore = new ExecutorPodsSnapshotsStoreImpl(subscribersExecutor, conf = sc.conf)
 
     val executorPodsLifecycleEventHandler = new ExecutorPodsLifecycleManager(
       sc.conf,
       kubernetesClient,
       snapshotsStore)
 
-    val executorPodsAllocator = new ExecutorPodsAllocator(
-      sc.conf,
-      sc.env.securityManager,
-      new KubernetesExecutorBuilder(),
-      kubernetesClient,
-      snapshotsStore,
-      new SystemClock())
+    val executorPodsAllocator = makeExecutorPodsAllocator(sc, kubernetesClient, snapshotsStore)
 
     val podsWatchEventSource = new ExecutorPodsWatchSnapshotSource(
       snapshotsStore,
-      kubernetesClient)
+      kubernetesClient,
+      sc.conf)
 
     val eventsPollingExecutor = ThreadUtils.newDaemonSingleThreadScheduledExecutor(
       "kubernetes-executor-pod-polling-sync")
@@ -136,6 +155,31 @@ private[spark] class KubernetesClusterManager extends ExternalClusterManager wit
       executorPodsLifecycleEventHandler,
       podsWatchEventSource,
       podsPollingEventSource)
+  }
+
+  private[k8s] def makeExecutorPodsAllocator(sc: SparkContext, kubernetesClient: KubernetesClient,
+      snapshotsStore: ExecutorPodsSnapshotsStore) = {
+    val executorPodsAllocatorName = sc.conf.get(KUBERNETES_ALLOCATION_PODS_ALLOCATOR) match {
+      case "statefulset" =>
+        classOf[StatefulSetPodsAllocator].getName
+      case "direct" =>
+        classOf[ExecutorPodsAllocator].getName
+      case fullClass =>
+        fullClass
+    }
+
+    val cls = Utils.classForName[AbstractPodsAllocator](executorPodsAllocatorName)
+    val cstr = cls.getConstructor(
+      classOf[SparkConf], classOf[org.apache.spark.SecurityManager],
+      classOf[KubernetesExecutorBuilder], classOf[KubernetesClient],
+      classOf[ExecutorPodsSnapshotsStore], classOf[Clock])
+    cstr.newInstance(
+      sc.conf,
+      sc.env.securityManager,
+      new KubernetesExecutorBuilder(),
+      kubernetesClient,
+      snapshotsStore,
+      new SystemClock())
   }
 
   override def initialize(scheduler: TaskScheduler, backend: SchedulerBackend): Unit = {

@@ -103,16 +103,18 @@ public class TransportRequestHandler extends MessageHandler<RequestMessage> {
 
   @Override
   public void handle(RequestMessage request) throws Exception {
-    if (request instanceof ChunkFetchRequest) {
-      chunkFetchRequestHandler.processFetchRequest(channel, (ChunkFetchRequest) request);
-    } else if (request instanceof RpcRequest) {
-      processRpcRequest((RpcRequest) request);
-    } else if (request instanceof OneWayMessage) {
-      processOneWayMessage((OneWayMessage) request);
-    } else if (request instanceof StreamRequest) {
-      processStreamRequest((StreamRequest) request);
-    } else if (request instanceof UploadStream) {
-      processStreamUpload((UploadStream) request);
+    if (request instanceof ChunkFetchRequest chunkFetchRequest) {
+      chunkFetchRequestHandler.processFetchRequest(channel, chunkFetchRequest);
+    } else if (request instanceof RpcRequest rpcRequest) {
+      processRpcRequest(rpcRequest);
+    } else if (request instanceof OneWayMessage oneWayMessage) {
+      processOneWayMessage(oneWayMessage);
+    } else if (request instanceof StreamRequest streamRequest) {
+      processStreamRequest(streamRequest);
+    } else if (request instanceof UploadStream uploadStream) {
+      processStreamUpload(uploadStream);
+    } else if (request instanceof MergedBlockMetaRequest mergedBlockMetaRequest) {
+      processMergedBlockMetaRequest(mergedBlockMetaRequest);
     } else {
       throw new IllegalArgumentException("Unknown request type: " + request);
     }
@@ -149,7 +151,7 @@ public class TransportRequestHandler extends MessageHandler<RequestMessage> {
         streamManager.streamSent(req.streamId);
       });
     } else {
-      // org.apache.spark.repl.ExecutorClassLoader.STREAM_NOT_FOUND_REGEX should also be updated
+      // org.apache.spark.executor.ExecutorClassLoader.STREAM_NOT_FOUND_REGEX should also be updated
       // when the following error message is changed.
       respond(new StreamFailure(req.streamId, String.format(
         "Stream '%s' was not found.", req.streamId)));
@@ -211,7 +213,15 @@ public class TransportRequestHandler extends MessageHandler<RequestMessage> {
         public void onComplete(String streamId) throws IOException {
            try {
              streamHandler.onComplete(streamId);
-             callback.onSuccess(ByteBuffer.allocate(0));
+             callback.onSuccess(streamHandler.getCompletionResponse());
+           } catch (BlockPushNonFatalFailure ex) {
+             // Respond an RPC message with the error code to client instead of using exceptions
+             // encoded in the RPCFailure. This type of exceptions gets thrown more frequently
+             // than a regular exception on the shuffle server side due to the best-effort nature
+             // of push-based shuffle and requires special handling on the client side. Using a
+             // proper RPCResponse is more efficient.
+             callback.onSuccess(ex.getResponse());
+             streamHandler.onFailure(streamId, ex);
            } catch (Exception ex) {
              IOException ioExc = new IOException("Failure post-processing complete stream;" +
                " failing this rpc and leaving channel active", ex);
@@ -239,8 +249,17 @@ public class TransportRequestHandler extends MessageHandler<RequestMessage> {
         wrappedCallback.onComplete(wrappedCallback.getID());
       }
     } catch (Exception e) {
-      logger.error("Error while invoking RpcHandler#receive() on RPC id " + req.requestId, e);
-      respond(new RpcFailure(req.requestId, Throwables.getStackTraceAsString(e)));
+      if (e instanceof BlockPushNonFatalFailure blockPushNonFatalFailure) {
+        // Thrown by rpcHandler.receiveStream(reverseClient, meta, callback), the same as
+        // onComplete method. Respond an RPC message with the error code to client instead of
+        // using exceptions encoded in the RPCFailure. Using a proper RPCResponse is more
+        // efficient, and now only include the too old attempt case here.
+        respond(new RpcResponse(req.requestId,
+          new NioManagedBuffer(blockPushNonFatalFailure.getResponse())));
+      } else {
+        logger.error("Error while invoking RpcHandler#receive() on RPC id " + req.requestId, e);
+        respond(new RpcFailure(req.requestId, Throwables.getStackTraceAsString(e)));
+      }
       // We choose to totally fail the channel, rather than trying to recover as we do in other
       // cases.  We don't know how many bytes of the stream the client has already sent for the
       // stream, it's not worth trying to recover.
@@ -257,6 +276,30 @@ public class TransportRequestHandler extends MessageHandler<RequestMessage> {
       logger.error("Error while invoking RpcHandler#receive() for one-way message.", e);
     } finally {
       req.body().release();
+    }
+  }
+
+  private void processMergedBlockMetaRequest(final MergedBlockMetaRequest req) {
+    try {
+      rpcHandler.getMergedBlockMetaReqHandler().receiveMergeBlockMetaReq(reverseClient, req,
+        new MergedBlockMetaResponseCallback() {
+
+          @Override
+          public void onSuccess(int numChunks, ManagedBuffer buffer) {
+            logger.trace("Sending meta for request {} numChunks {}", req, numChunks);
+            respond(new MergedBlockMetaSuccess(req.requestId, numChunks, buffer));
+          }
+
+          @Override
+          public void onFailure(Throwable e) {
+            logger.trace("Failed to send meta for {}", req);
+            respond(new RpcFailure(req.requestId, Throwables.getStackTraceAsString(e)));
+          }
+      });
+    } catch (Exception e) {
+      logger.error("Error while invoking receiveMergeBlockMetaReq() for appId {} shuffleId {} "
+        + "reduceId {}", req.appId, req.shuffleId, req.appId, e);
+      respond(new RpcFailure(req.requestId, Throwables.getStackTraceAsString(e)));
     }
   }
 

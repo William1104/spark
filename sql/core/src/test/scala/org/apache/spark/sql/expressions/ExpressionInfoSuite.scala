@@ -17,16 +17,16 @@
 
 package org.apache.spark.sql.expressions
 
-import scala.collection.parallel.immutable.ParVector
-
 import org.apache.spark.SparkFunSuite
 import org.apache.spark.sql.catalyst.{FunctionIdentifier, InternalRow}
 import org.apache.spark.sql.catalyst.expressions._
 import org.apache.spark.sql.execution.HiveResult.hiveResultString
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.sql.test.SharedSparkSession
-import org.apache.spark.util.Utils
+import org.apache.spark.tags.SlowSQLTest
+import org.apache.spark.util.{ThreadUtils, Utils}
 
+@SlowSQLTest
 class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
 
   test("Replace _FUNC_ in ExpressionInfo") {
@@ -51,33 +51,52 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
     Seq("agg_funcs", "array_funcs", "datetime_funcs", "json_funcs", "map_funcs", "window_funcs")
         .foreach { groupName =>
       val info = new ExpressionInfo(
-        "testClass", null, "testName", null, "", "", "", groupName, "", "")
+        "testClass", null, "testName", null, "", "", "", groupName, "", "", "")
       assert(info.getGroup === groupName)
     }
 
     val errMsg = intercept[IllegalArgumentException] {
       val invalidGroupName = "invalid_group_funcs"
-      new ExpressionInfo("testClass", null, "testName", null, "", "", "", invalidGroupName, "", "")
+      new ExpressionInfo(
+        "testClass", null, "testName", null, "", "", "", invalidGroupName, "", "", "")
     }.getMessage
     assert(errMsg.contains("'group' is malformed in the expression [testName]."))
+  }
+
+  test("source in ExpressionInfo") {
+    val info = spark.sessionState.catalog.lookupFunctionInfo(FunctionIdentifier("sum"))
+    assert(info.getSource === "built-in")
+
+    Seq("python_udf", "java_udf", "scala_udf", "built-in", "hive").foreach { source =>
+      val info = new ExpressionInfo(
+        "testClass", null, "testName", null, "", "", "", "", "", "", source)
+      assert(info.getSource === source)
+    }
+    val errMsg = intercept[IllegalArgumentException] {
+      val invalidSource = "invalid_source"
+      new ExpressionInfo(
+        "testClass", null, "testName", null, "", "", "", "", "", "", invalidSource)
+    }.getMessage
+    assert(errMsg.contains("'source' is malformed in the expression [testName]."))
   }
 
   test("error handling in ExpressionInfo") {
     val errMsg1 = intercept[IllegalArgumentException] {
       val invalidNote = "  invalid note"
-      new ExpressionInfo("testClass", null, "testName", null, "", "", invalidNote, "", "", "")
+      new ExpressionInfo("testClass", null, "testName", null, "", "", invalidNote, "", "", "", "")
     }.getMessage
     assert(errMsg1.contains("'note' is malformed in the expression [testName]."))
 
     val errMsg2 = intercept[IllegalArgumentException] {
       val invalidSince = "-3.0.0"
-      new ExpressionInfo("testClass", null, "testName", null, "", "", "", "", invalidSince, "")
+      new ExpressionInfo("testClass", null, "testName", null, "", "", "", "", invalidSince, "", "")
     }.getMessage
     assert(errMsg2.contains("'since' is malformed in the expression [testName]."))
 
     val errMsg3 = intercept[IllegalArgumentException] {
       val invalidDeprecated = "  invalid deprecated"
-      new ExpressionInfo("testClass", null, "testName", null, "", "", "", "", "", invalidDeprecated)
+      new ExpressionInfo(
+        "testClass", null, "testName", null, "", "", "", "", "", invalidDeprecated, "")
     }.getMessage
     assert(errMsg3.contains("'deprecated' is malformed in the expression [testName]."))
   }
@@ -94,14 +113,16 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
       // _FUNC_ is replaced by `%` which causes a parsing error on `SELECT %(2, 1.8)`
       "org.apache.spark.sql.catalyst.expressions.Remainder",
       // Examples demonstrate alternative names, see SPARK-20749
-      "org.apache.spark.sql.catalyst.expressions.Length")
+      "org.apache.spark.sql.catalyst.expressions.Length",
+      // Examples demonstrate alternative syntax, see SPARK-45574
+      "org.apache.spark.sql.catalyst.expressions.Cast")
     spark.sessionState.functionRegistry.listFunction().foreach { funcId =>
       val info = spark.sessionState.catalog.lookupFunctionInfo(funcId)
       val className = info.getClassName
       withClue(s"Expression class '$className'") {
         val exprExamples = info.getOriginalExamples
         if (!exprExamples.isEmpty && !ignoreSet.contains(className)) {
-          assert(exampleRe.findAllIn(exprExamples).toIterable
+          assert(exampleRe.findAllIn(exprExamples).iterator.to(Iterable)
             .filter(setStmtRe.findFirstIn(_).isEmpty) // Ignore SET commands
             .forall(_.contains("_FUNC_")))
         }
@@ -112,8 +133,6 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
   test("SPARK-32870: Default expressions in FunctionRegistry should have their " +
     "usage, examples, since, and group filled") {
     val ignoreSet = Set(
-      // Explicitly inherits NonSQLExpression, and has no ExpressionDescription
-      "org.apache.spark.sql.catalyst.expressions.TimeWindow",
       // Cast aliases do not need examples
       "org.apache.spark.sql.catalyst.expressions.Cast")
 
@@ -153,9 +172,11 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
       // One of examples shows getting the current timestamp
       "org.apache.spark.sql.catalyst.expressions.UnixTimestamp",
       "org.apache.spark.sql.catalyst.expressions.CurrentDate",
+      "org.apache.spark.sql.catalyst.expressions.CurDateExpressionBuilder",
       "org.apache.spark.sql.catalyst.expressions.CurrentTimestamp",
       "org.apache.spark.sql.catalyst.expressions.CurrentTimeZone",
       "org.apache.spark.sql.catalyst.expressions.Now",
+      "org.apache.spark.sql.catalyst.expressions.LocalTimestamp",
       // Random output without a seed
       "org.apache.spark.sql.catalyst.expressions.Rand",
       "org.apache.spark.sql.catalyst.expressions.Randn",
@@ -169,16 +190,24 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
       "org.apache.spark.sql.catalyst.expressions.InputFileBlockLength",
       // The example calls methods that return unstable results.
       "org.apache.spark.sql.catalyst.expressions.CallMethodViaReflection",
+      "org.apache.spark.sql.catalyst.expressions.TryReflect",
       "org.apache.spark.sql.catalyst.expressions.SparkVersion",
       // Throws an error
-      "org.apache.spark.sql.catalyst.expressions.RaiseError")
+      "org.apache.spark.sql.catalyst.expressions.RaiseErrorExpressionBuilder",
+      "org.apache.spark.sql.catalyst.expressions.AssertTrue",
+      classOf[CurrentUser].getName,
+      // The encrypt expression includes a random initialization vector to its encrypted result
+      classOf[AesEncrypt].getName)
 
-    val parFuncs = new ParVector(spark.sessionState.functionRegistry.listFunction().toVector)
-    parFuncs.foreach { funcId =>
+    ThreadUtils.parmap(
+      spark.sessionState.functionRegistry.listFunction(),
+      prefix = "ExpressionInfoSuite-check-outputs-of-expression-examples",
+      maxThreads = Runtime.getRuntime.availableProcessors
+    ) { funcId =>
       // Examples can change settings. We clone the session to prevent tests clashing.
       val clonedSpark = spark.cloneSession()
       // Coalescing partitions can change result order, so disable it.
-      clonedSpark.sessionState.conf.setConf(SQLConf.COALESCE_PARTITIONS_ENABLED, false)
+      clonedSpark.conf.set(SQLConf.COALESCE_PARTITIONS_ENABLED, false)
       val info = clonedSpark.sessionState.catalog.lookupFunctionInfo(funcId)
       val className = info.getClassName
       if (!ignoreSet.contains(className)) {
@@ -207,11 +236,6 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
 
     // Do not check these expressions, because these expressions override the eval method
     val ignoreSet = Set(
-      // Extend NullIntolerant and avoid evaluating input1 if input2 is 0
-      classOf[IntegralDivide],
-      classOf[Divide],
-      classOf[Remainder],
-      classOf[Pmod],
       // Throws an exception, even if input is null
       classOf[RaiseError]
     )
@@ -221,6 +245,8 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
       .filterNot(c => ignoreSet.exists(_.getName.equals(c)))
       .map(name => Utils.classForName(name))
       .filterNot(classOf[NonSQLExpression].isAssignableFrom)
+      // BinaryArithmetic overrides the eval method
+      .filterNot(classOf[BinaryArithmetic].isAssignableFrom)
 
     exprTypesToCheck.foreach { superClass =>
       candidateExprsToCheck.filter(superClass.isAssignableFrom).foreach { clazz =>
@@ -238,5 +264,27 @@ class ExpressionInfoSuite extends SparkFunSuite with SharedSparkSession {
         }
       }
     }
+  }
+
+  test("Check source for Built-in and Scala UDF") {
+    import org.apache.spark.sql.IntegratedUDFTestUtils
+    val catalog = spark.sessionState.catalog
+    assert(catalog.lookupFunctionInfo(FunctionIdentifier("sum")).getSource === "built-in")
+
+    val scalaUDF = IntegratedUDFTestUtils.TestScalaUDF("scalaUDF")
+    IntegratedUDFTestUtils.registerTestUDF(scalaUDF, spark)
+    val scalaInfo = catalog.lookupFunctionInfo(FunctionIdentifier(scalaUDF.name))
+    assert(scalaInfo.getSource === "scala_udf")
+  }
+
+  test("Check source for Python UDF") {
+    import org.apache.spark.sql.IntegratedUDFTestUtils
+    assume(IntegratedUDFTestUtils.shouldTestPythonUDFs)
+
+    val catalog = spark.sessionState.catalog
+    val pythonUDF = IntegratedUDFTestUtils.TestPythonUDF("pythonUDF")
+    IntegratedUDFTestUtils.registerTestUDF(pythonUDF, spark)
+    val pythonInfo = catalog.lookupFunctionInfo(FunctionIdentifier(pythonUDF.name))
+    assert(pythonInfo.getSource === "python_udf")
   }
 }

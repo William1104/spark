@@ -56,14 +56,14 @@ def generate_sql_configs_table_html(sql_configs, path):
     The table will look something like this:
 
     ```html
-    <table class="table">
+    <table class="spark-config">
     <tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr>
 
     <tr>
         <td><code>spark.sql.adaptive.enabled</code></td>
-        <td>false</td>
+        <td>true</td>
         <td><p>When true, enable adaptive query execution.</p></td>
-        <td>2.1.0</td>
+        <td>1.6.0</td>
     </tr>
 
     ...
@@ -76,7 +76,7 @@ def generate_sql_configs_table_html(sql_configs, path):
     with open(path, 'w') as f:
         f.write(dedent(
             """
-            <table class="table">
+            <table class="spark-config">
             <tr><th>Property Name</th><th>Default</th><th>Meaning</th><th>Since Version</th></tr>
             """
         ))
@@ -94,7 +94,7 @@ def generate_sql_configs_table_html(sql_configs, path):
                 default = config.default
 
             if default.startswith("<"):
-                raise Exception(
+                raise RuntimeError(
                     "Unhandled reference in SQL config docs. Config '{name}' "
                     "has default '{default}' that looks like an HTML tag."
                     .format(

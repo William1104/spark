@@ -500,15 +500,15 @@ class ExternalSorterSuite extends SparkFunSuite with LocalSparkContext {
         intercept[SparkException] {
           data.reduceByKey(_ + _).count()
         }
-        // After the shuffle, there should be only 2 files on disk: the output of task 1 and
-        // its index. All other files (map 2's output and intermediate merge files) should
-        // have been deleted.
-        assert(diskBlockManager.getAllFiles().length === 2)
+        // After the shuffle, there should be only 3 files on disk: the output of task 1 and
+        // its index and checksum. All other files (map 2's output and intermediate merge files)
+        // should have been deleted.
+        assert(diskBlockManager.getAllFiles().length === 3)
       } else {
         assert(data.reduceByKey(_ + _).count() === size)
-        // After the shuffle, there should be only 4 files on disk: the output of both tasks
-        // and their indices. All intermediate merge files should have been deleted.
-        assert(diskBlockManager.getAllFiles().length === 4)
+        // After the shuffle, there should be only 6 files on disk: the output of both tasks
+        // and their indices/checksums. All intermediate merge files should have been deleted.
+        assert(diskBlockManager.getAllFiles().length === 6)
       }
     }
   }
@@ -544,7 +544,7 @@ class ExternalSorterSuite extends SparkFunSuite with LocalSparkContext {
     val expected = (0 until 3).map { p =>
       var v = (0 until size).map { i => (i / 4, i) }.filter { case (k, _) => k % 3 == p }.toSet
       if (withPartialAgg) {
-        v = v.groupBy(_._1).mapValues { s => s.map(_._2).sum }.toSet
+        v = v.groupBy(_._1).transform((_, s) => s.map(_._2).sum).toSet
       }
       (p, v.toSet)
     }.toSet

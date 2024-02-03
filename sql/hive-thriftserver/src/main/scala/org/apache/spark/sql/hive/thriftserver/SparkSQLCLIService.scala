@@ -21,14 +21,14 @@ import java.io.IOException
 import java.util.{List => JList}
 import javax.security.auth.login.LoginException
 
-import scala.collection.JavaConverters._
+import scala.jdk.CollectionConverters._
 import scala.util.control.NonFatal
 
 import org.apache.hadoop.hive.conf.HiveConf
 import org.apache.hadoop.hive.conf.HiveConf.ConfVars
 import org.apache.hadoop.hive.shims.Utils
 import org.apache.hadoop.security.{SecurityUtil, UserGroupInformation}
-import org.apache.hive.service.{AbstractService, CompositeService, Service, ServiceException}
+import org.apache.hive.service.{AbstractService, CompositeService, Service}
 import org.apache.hive.service.Service.STATE
 import org.apache.hive.service.auth.HiveAuthFactory
 import org.apache.hive.service.cli._
@@ -36,6 +36,8 @@ import org.apache.hive.service.server.HiveServer2
 import org.slf4j.Logger
 
 import org.apache.spark.sql.SQLContext
+import org.apache.spark.sql.catalyst.util.SQLKeywordUtils
+import org.apache.spark.sql.errors.QueryExecutionErrors
 import org.apache.spark.sql.hive.thriftserver.ReflectionUtils._
 
 private[hive] class SparkSQLCLIService(hiveServer: HiveServer2, sqlContext: SQLContext)
@@ -56,8 +58,7 @@ private[hive] class SparkSQLCLIService(hiveServer: HiveServer2, sqlContext: SQLC
         val principal = hiveConf.getVar(ConfVars.HIVE_SERVER2_KERBEROS_PRINCIPAL)
         val keyTabFile = hiveConf.getVar(ConfVars.HIVE_SERVER2_KERBEROS_KEYTAB)
         if (principal.isEmpty || keyTabFile.isEmpty) {
-          throw new IOException(
-            "HiveServer2 Kerberos principal or keytab is not correctly configured")
+          throw QueryExecutionErrors.invalidKerberosConfigForHiveServer2Error()
         }
 
         val originalUgi = UserGroupInformation.getCurrentUser
@@ -72,7 +73,7 @@ private[hive] class SparkSQLCLIService(hiveServer: HiveServer2, sqlContext: SQLC
         setSuperField(this, "serviceUGI", sparkServiceUGI)
       } catch {
         case e @ (_: IOException | _: LoginException) =>
-          throw new ServiceException("Unable to login to kerberos with given principal/keytab", e)
+          throw HiveThriftServerErrors.cannotLoginToKerberosError(e)
       }
 
       // Try creating spnego UGI if it is configured.
@@ -84,8 +85,7 @@ private[hive] class SparkSQLCLIService(hiveServer: HiveServer2, sqlContext: SQLC
           setSuperField(this, "httpUGI", httpUGI)
         } catch {
           case e: IOException =>
-            throw new ServiceException("Unable to login to spnego with given principal " +
-              s"$principal and keytab $keyTabFile: $e", e)
+            throw HiveThriftServerErrors.cannotLoginToSpnegoError(principal, keyTabFile, e)
         }
       }
     }
@@ -104,7 +104,8 @@ private[hive] class SparkSQLCLIService(hiveServer: HiveServer2, sqlContext: SQLC
       case GetInfoType.CLI_SERVER_NAME => new GetInfoValue("Spark SQL")
       case GetInfoType.CLI_DBMS_NAME => new GetInfoValue("Spark SQL")
       case GetInfoType.CLI_DBMS_VER => new GetInfoValue(sqlContext.sparkContext.version)
-      case GetInfoType.CLI_ODBC_KEYWORDS => new GetInfoValue("Unimplemented")
+      case GetInfoType.CLI_ODBC_KEYWORDS =>
+        new GetInfoValue(SQLKeywordUtils.keywords.mkString(","))
       case _ => super.getInfo(sessionHandle, getInfoType)
     }
   }
@@ -139,7 +140,7 @@ private[thriftserver] trait ReflectedCompositeService { this: AbstractService =>
         serviceStartCount += 1
       }
       // Emulating `AbstractService.start`
-      val startTime = new java.lang.Long(System.currentTimeMillis())
+      val startTime = java.lang.Long.valueOf(System.currentTimeMillis())
       setAncestorField(this, 3, "startTime", startTime)
       invoke(classOf[AbstractService], this, "ensureCurrentState", classOf[STATE] -> STATE.INITED)
       invoke(classOf[AbstractService], this, "changeState", classOf[STATE] -> STATE.STARTED)
@@ -148,8 +149,8 @@ private[thriftserver] trait ReflectedCompositeService { this: AbstractService =>
       case NonFatal(e) =>
       logError(s"Error starting services $getName", e)
       invoke(classOf[CompositeService], this, "stop",
-        classOf[Int] -> new Integer(serviceStartCount))
-      throw new ServiceException("Failed to Start " + getName, e)
+        classOf[Int] -> Integer.valueOf(serviceStartCount))
+      throw HiveThriftServerErrors.failedToStartServiceError(getName, e)
     }
   }
 }

@@ -17,11 +17,12 @@
 
 package org.apache.spark.storage
 
-import scala.collection.generic.CanBuildFrom
+import scala.collection.BuildFrom
 import scala.collection.immutable.Iterable
 import scala.concurrent.Future
 
-import org.apache.spark.{SparkConf, SparkException}
+import org.apache.spark.SparkConf
+import org.apache.spark.errors.SparkCoreErrors
 import org.apache.spark.internal.Logging
 import org.apache.spark.rpc.RpcEndpointRef
 import org.apache.spark.storage.BlockManagerMessages._
@@ -73,11 +74,25 @@ class BlockManagerMaster(
       localDirs: Array[String],
       maxOnHeapMemSize: Long,
       maxOffHeapMemSize: Long,
-      storageEndpoint: RpcEndpointRef): BlockManagerId = {
+      storageEndpoint: RpcEndpointRef,
+      isReRegister: Boolean = false): BlockManagerId = {
     logInfo(s"Registering BlockManager $id")
     val updatedId = driverEndpoint.askSync[BlockManagerId](
-      RegisterBlockManager(id, localDirs, maxOnHeapMemSize, maxOffHeapMemSize, storageEndpoint))
-    logInfo(s"Registered BlockManager $updatedId")
+      RegisterBlockManager(
+        id,
+        localDirs,
+        maxOnHeapMemSize,
+        maxOffHeapMemSize,
+        storageEndpoint,
+        isReRegister
+      )
+    )
+    if (updatedId.executorId == BlockManagerId.INVALID_EXECUTOR_ID) {
+      assert(isReRegister, "Got invalid executor id from non re-register case")
+      logInfo(s"Re-register BlockManager $id failed")
+    } else {
+      logInfo(s"Registered BlockManager $updatedId")
+    }
     updatedId
   }
 
@@ -91,6 +106,19 @@ class BlockManagerMaster(
       UpdateBlockInfo(blockManagerId, blockId, storageLevel, memSize, diskSize))
     logDebug(s"Updated info of block $blockId")
     res
+  }
+
+  def updateRDDBlockTaskInfo(blockId: RDDBlockId, taskId: Long): Unit = {
+    driverEndpoint.askSync[Unit](UpdateRDDBlockTaskInfo(blockId, taskId))
+  }
+
+  def updateRDDBlockVisibility(taskId: Long, visible: Boolean): Unit = {
+    driverEndpoint.ask[Unit](UpdateRDDBlockVisibility(taskId, visible))
+  }
+
+  /** Check whether a block is visible */
+  def isRDDBlockVisible(blockId: RDDBlockId): Boolean = {
+    driverEndpoint.askSync[Boolean](GetRDDBlockVisibility(blockId))
   }
 
   /** Get locations of the blockId from the driver */
@@ -117,7 +145,7 @@ class BlockManagerMaster(
    * those blocks that are reported to block manager master.
    */
   def contains(blockId: BlockId): Boolean = {
-    !getLocations(blockId).isEmpty
+    getLocations(blockId).nonEmpty
   }
 
   /** Get ids of other nodes in the cluster from the driver */
@@ -142,7 +170,7 @@ class BlockManagerMaster(
    * @param host
    */
   def removeShufflePushMergerLocation(host: String): Unit = {
-    driverEndpoint.askSync[Seq[BlockManagerId]](RemoveShufflePushMergerLocation(host))
+    driverEndpoint.askSync[Unit](RemoveShufflePushMergerLocation(host))
   }
 
   def getExecutorEndpointRef(executorId: String): Option[RpcEndpointRef] = {
@@ -231,16 +259,15 @@ class BlockManagerMaster(
     val response = driverEndpoint.
       askSync[Map[BlockManagerId, Future[Option[BlockStatus]]]](msg)
     val (blockManagerIds, futures) = response.unzip
-    implicit val sameThread = ThreadUtils.sameThread
     val cbf =
       implicitly[
-        CanBuildFrom[Iterable[Future[Option[BlockStatus]]],
+        BuildFrom[Iterable[Future[Option[BlockStatus]]],
         Option[BlockStatus],
         Iterable[Option[BlockStatus]]]]
     val blockStatus = timeout.awaitResult(
       Future.sequence(futures)(cbf, ThreadUtils.sameThread))
     if (blockStatus == null) {
-      throw new SparkException("BlockManager returned null for BlockStatus query: " + blockId)
+      throw SparkCoreErrors.blockStatusQueryReturnedNullError(blockId)
     }
     blockManagerIds.zip(blockStatus).flatMap { case (blockManagerId, status) =>
       status.map { s => (blockManagerId, s) }
@@ -280,7 +307,7 @@ class BlockManagerMaster(
   /** Send a one-way message to the master endpoint, to which we expect it to reply with true. */
   private def tell(message: Any): Unit = {
     if (!driverEndpoint.askSync[Boolean](message)) {
-      throw new SparkException("BlockManagerMasterEndpoint returned false, expected true.")
+      throw SparkCoreErrors.unexpectedBlockManagerMasterEndpointResultError()
     }
   }
 

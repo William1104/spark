@@ -47,6 +47,7 @@ abstract class AbstractCommandBuilder {
   String javaHome;
   String mainClass;
   String master;
+  String remote;
   protected String propertiesFile;
   final List<String> appArgs;
   final List<String> jars;
@@ -120,9 +121,7 @@ abstract class AbstractCommandBuilder {
 
   void addOptionString(List<String> cmd, String options) {
     if (!isEmpty(options)) {
-      for (String opt : parseOptionString(options)) {
-        cmd.add(opt);
-      }
+      cmd.addAll(parseOptionString(options));
     }
   }
 
@@ -157,7 +156,6 @@ abstract class AbstractCommandBuilder {
         "launcher",
         "mllib",
         "repl",
-        "resource-managers/mesos",
         "resource-managers/yarn",
         "sql/catalyst",
         "sql/core",
@@ -231,17 +229,21 @@ abstract class AbstractCommandBuilder {
       return scala;
     }
     String sparkHome = getSparkHome();
-    File scala212 = new File(sparkHome, "launcher/target/scala-2.12");
     File scala213 = new File(sparkHome, "launcher/target/scala-2.13");
-    checkState(!scala212.isDirectory() || !scala213.isDirectory(),
-      "Presence of build for multiple Scala versions detected.\n" +
-      "Either clean one of them or set SPARK_SCALA_VERSION in your environment.");
-    if (scala213.isDirectory()) {
-      return "2.13";
-    } else {
-      checkState(scala212.isDirectory(), "Cannot find any build directories.");
-      return "2.12";
-    }
+    checkState(scala213.isDirectory(), "Cannot find any build directories.");
+    return "2.13";
+    // String sparkHome = getSparkHome();
+    // File scala212 = new File(sparkHome, "launcher/target/scala-2.12");
+    // File scala213 = new File(sparkHome, "launcher/target/scala-2.13");
+    // checkState(!scala212.isDirectory() || !scala213.isDirectory(),
+    //  "Presence of build for multiple Scala versions detected.\n" +
+    //  "Either clean one of them or set SPARK_SCALA_VERSION in your environment.");
+    // if (scala213.isDirectory()) {
+    //  return "2.13";
+    // } else {
+    //  checkState(scala212.isDirectory(), "Cannot find any build directories.");
+    //  return "2.12";
+    // }
   }
 
   String getSparkHome() {
@@ -267,11 +269,8 @@ abstract class AbstractCommandBuilder {
     if (effectiveConfig == null) {
       effectiveConfig = new HashMap<>(conf);
       Properties p = loadPropertiesFile();
-      for (String key : p.stringPropertyNames()) {
-        if (!effectiveConfig.containsKey(key)) {
-          effectiveConfig.put(key, p.getProperty(key));
-        }
-      }
+      p.stringPropertyNames().forEach(key ->
+        effectiveConfig.computeIfAbsent(key, p::getProperty));
     }
     return effectiveConfig;
   }

@@ -23,6 +23,8 @@ Spark SQL is Apache Spark's module for working with structured data. The SQL Syn
 
 ### DDL Statements
 
+Data Definition Statements are used to create or modify the structure of database objects in a database. Spark SQL supports the following Data Definition Statements:
+
  * [ALTER DATABASE](sql-ref-syntax-ddl-alter-database.html)
  * [ALTER TABLE](sql-ref-syntax-ddl-alter-table.html)
  * [ALTER VIEW](sql-ref-syntax-ddl-alter-view.html)
@@ -30,9 +32,11 @@ Spark SQL is Apache Spark's module for working with structured data. The SQL Syn
  * [CREATE FUNCTION](sql-ref-syntax-ddl-create-function.html)
  * [CREATE TABLE](sql-ref-syntax-ddl-create-table.html)
  * [CREATE VIEW](sql-ref-syntax-ddl-create-view.html)
+ * [DECLARE VARIABLE](sql-ref-syntax-ddl-declare-variable.html)
  * [DROP DATABASE](sql-ref-syntax-ddl-drop-database.html)
  * [DROP FUNCTION](sql-ref-syntax-ddl-drop-function.html)
  * [DROP TABLE](sql-ref-syntax-ddl-drop-table.html)
+ * [DROP TEMPORARY VARIABLE](sql-ref-syntax-ddl-drop-variable.html)
  * [DROP VIEW](sql-ref-syntax-ddl-drop-view.html)
  * [REPAIR TABLE](sql-ref-syntax-ddl-repair-table.html)
  * [TRUNCATE TABLE](sql-ref-syntax-ddl-truncate-table.html)
@@ -40,13 +44,21 @@ Spark SQL is Apache Spark's module for working with structured data. The SQL Syn
 
 ### DML Statements
 
- * [INSERT INTO](sql-ref-syntax-dml-insert-into.html)
- * [INSERT OVERWRITE](sql-ref-syntax-dml-insert-overwrite-table.html)
+Data Manipulation Statements are used to add, change, or delete data. Spark SQL supports the following Data Manipulation Statements:
+
+ * [INSERT TABLE](sql-ref-syntax-dml-insert-table.html)
  * [INSERT OVERWRITE DIRECTORY](sql-ref-syntax-dml-insert-overwrite-directory.html)
- * [INSERT OVERWRITE DIRECTORY with Hive format](sql-ref-syntax-dml-insert-overwrite-directory-hive.html)
  * [LOAD](sql-ref-syntax-dml-load.html)
 
 ### Data Retrieval Statements
+
+Spark supports <code>SELECT</code> statement that is used to retrieve rows
+from one or more tables according to the specified clauses. The full syntax
+and brief description of supported clauses are explained in
+[SELECT](sql-ref-syntax-qry-select.html) section. The SQL statements related
+to SELECT are also included in this section. Spark also provides the
+ability to generate logical and physical plan for a given query using
+[EXPLAIN](sql-ref-syntax-qry-explain.html) statement.
 
  * [SELECT Statement](sql-ref-syntax-qry-select.html)
    * [Common Table Expression](sql-ref-syntax-qry-select-cte.html)
@@ -60,17 +72,22 @@ Spark SQL is Apache Spark's module for working with structured data. The SQL Syn
    * [JOIN](sql-ref-syntax-qry-select-join.html)
    * [LIKE Predicate](sql-ref-syntax-qry-select-like.html)
    * [LIMIT Clause](sql-ref-syntax-qry-select-limit.html)
+   * [OFFSET Clause](sql-ref-syntax-qry-select-offset.html)
    * [ORDER BY Clause](sql-ref-syntax-qry-select-orderby.html)
    * [Set Operators](sql-ref-syntax-qry-select-setops.html)
    * [SORT BY Clause](sql-ref-syntax-qry-select-sortby.html)
    * [TABLESAMPLE](sql-ref-syntax-qry-select-sampling.html)
    * [Table-valued Function](sql-ref-syntax-qry-select-tvf.html)
    * [WHERE Clause](sql-ref-syntax-qry-select-where.html)
+   * [Aggregate Function](sql-ref-syntax-qry-select-aggregate.html)
    * [Window Function](sql-ref-syntax-qry-select-window.html)
    * [CASE Clause](sql-ref-syntax-qry-select-case.html)
    * [PIVOT Clause](sql-ref-syntax-qry-select-pivot.html)
+   * [UNPIVOT Clause](sql-ref-syntax-qry-select-unpivot.html)
    * [LATERAL VIEW Clause](sql-ref-syntax-qry-select-lateral-view.html)
+   * [LATERAL SUBQUERY](sql-ref-syntax-qry-select-lateral-subquery.html)
    * [TRANSFORM Clause](sql-ref-syntax-qry-select-transform.html)
+   * [star (*) Clause](sql-ref-syntax-qry-star.html)
  * [EXPLAIN](sql-ref-syntax-qry-explain.html)
 
 ### Auxiliary Statements
@@ -78,7 +95,6 @@ Spark SQL is Apache Spark's module for working with structured data. The SQL Syn
  * [ADD FILE](sql-ref-syntax-aux-resource-mgmt-add-file.html)
  * [ADD JAR](sql-ref-syntax-aux-resource-mgmt-add-jar.html)
  * [ANALYZE TABLE](sql-ref-syntax-aux-analyze-table.html)
- * [ANALYZE TABLES](sql-ref-syntax-aux-analyze-tables.html)
  * [CACHE TABLE](sql-ref-syntax-aux-cache-cache-table.html)
  * [CLEAR CACHE](sql-ref-syntax-aux-cache-clear-cache.html)
  * [DESCRIBE DATABASE](sql-ref-syntax-aux-describe-database.html)
@@ -92,6 +108,8 @@ Spark SQL is Apache Spark's module for working with structured data. The SQL Syn
  * [REFRESH FUNCTION](sql-ref-syntax-aux-cache-refresh-function.html)
  * [RESET](sql-ref-syntax-aux-conf-mgmt-reset.html)
  * [SET](sql-ref-syntax-aux-conf-mgmt-set.html)
+ * [SET VAR](sql-ref-syntax-aux-set-var.html)
+ * [EXECUTE IMMEDIATE](sql-ref-syntax-aux-exec-imm.html)
  * [SHOW COLUMNS](sql-ref-syntax-aux-show-columns.html)
  * [SHOW CREATE TABLE](sql-ref-syntax-aux-show-create-table.html)
  * [SHOW DATABASES](sql-ref-syntax-aux-show-databases.html)
